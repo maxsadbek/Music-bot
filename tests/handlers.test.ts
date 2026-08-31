@@ -92,7 +92,7 @@ describe('Telegram Bot Handlers', () => {
       await handleTextMessage(mockCtx);
 
       expect(mockCtx.reply).toHaveBeenCalledWith(
-        '🎬 Reel received\n\n⏳ Getting the video...'
+        '🎬 Reel qabul qilindi\n\n⏳ Video olinmoqda...'
       );
 
       expect(mockCtx.api.sendVideo).toHaveBeenCalledWith(

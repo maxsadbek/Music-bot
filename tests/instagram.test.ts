@@ -47,7 +47,6 @@ describe('SocialKit Instagram Service', () => {
       {
         access_key: 'test_socialkit_key',
         url: 'https://www.instagram.com/reel/DRU4smMj0cu/',
-        format: 'mp3',
       },
       {
         headers: {

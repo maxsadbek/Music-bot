@@ -197,7 +197,6 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
     const requestBody = {
       access_key: apiKey,
       url: normalizedUrl,
-      format: 'mp3',
     };
 
     const response = await axios.post(apiUrl, requestBody, {

@@ -21,7 +21,7 @@ import {
 
 /**
  * Sends Instagram Reel video to Telegram chat.
- * Tries direct media URL first; falls back to uploading Buffer via InputFile if URL fails.
+ * Tries direct media URL first; falls back to uploading Buffer via InputFile if direct URL fails.
  */
 export async function sendReelVideoToTelegram(
   ctx: Context,
@@ -30,16 +30,19 @@ export async function sendReelVideoToTelegram(
   buffer?: Buffer
 ): Promise<boolean> {
   const chatId = ctx.chat?.id;
-  if (!chatId) return false;
+  if (!chatId) {
+    logger.error('Telegram video send failed: Chat ID is missing from context');
+    return false;
+  }
 
-  // 1. Attempt sending by URL directly first
+  // 1. Attempt sending by direct URL first
   try {
-    logger.info('Sending video to Telegram by URL', { mediaUrl });
+    logger.info('Sending video to Telegram by direct URL', { mediaUrl });
     await ctx.api.sendVideo(chatId, mediaUrl);
-    logger.info('Video sent successfully via direct URL');
+    logger.info('Telegram video sent successfully via direct URL');
     return true;
   } catch (urlError) {
-    logger.warn('Failed to send video to Telegram via URL. Falling back to Buffer upload...', urlError);
+    logger.warn('Failed to send video to Telegram via direct URL. Attempting Buffer upload fallback...', urlError);
   }
 
   // 2. Fallback: Buffer upload via InputFile
@@ -50,17 +53,17 @@ export async function sendReelVideoToTelegram(
     }
 
     if (videoBuf.length > 50 * 1024 * 1024) {
-      logger.warn('Video exceeds Telegram 50MB bot upload limit', { size: videoBuf.length });
+      logger.error('Telegram video send failed: Video exceeds Telegram 50MB bot upload limit', { size: videoBuf.length });
       return false;
     }
 
     const filename = `${shortcode || 'reel'}.mp4`;
     logger.info('Sending video to Telegram via InputFile Buffer upload', { filename, size: videoBuf.length });
     await ctx.api.sendVideo(chatId, new InputFile(videoBuf, filename));
-    logger.info('Video sent successfully via Buffer upload');
+    logger.info('Telegram video sent successfully via Buffer upload');
     return true;
   } catch (bufError) {
-    logger.error('Failed to send video to Telegram via Buffer upload', bufError);
+    logger.error('Telegram video send failed', bufError);
     return false;
   }
 }
@@ -147,12 +150,22 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
   try {
     const { normalizedUrl, shortcode } = validateAndNormalizeInstagramUrl(urlInText);
 
-    statusMsg = await ctx.reply('🎬 Reel received\n\n⏳ Getting the video...');
+    // Step 1: Status message 🎬 Reel qabul qilindi
+    statusMsg = await ctx.reply('🎬 Reel qabul qilindi\n\n⏳ Video olinmoqda...');
 
-    // 1. Fetch direct media URL from SocialKit
+    // Step 2: Fetch direct video media URL from SocialKit
     const reelMedia = await getInstagramReel(normalizedUrl);
 
-    // 2. Download media Buffer once to reuse for both Telegram video upload and ACRCloud recognition
+    // Update status to 🎥 Video yuboriladi
+    if (statusMsg) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        statusMsg.message_id,
+        '🎥 Video yuboriladi...'
+      ).catch(() => {});
+    }
+
+    // Pre-download media buffer once to reuse for both Telegram upload fallback and ACRCloud recognition
     let downloadedBuffer: Buffer | undefined;
     try {
       downloadedBuffer = await downloadMediaBuffer(reelMedia.mediaUrl);
@@ -160,15 +173,19 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       logger.warn('Pre-downloading media buffer failed, fallback to URL download for recognition', downloadErr);
     }
 
-    // 3. Send video to Telegram
-    await sendReelVideoToTelegram(
+    // Step 3: Send video to Telegram AND AWAIT COMPLETION FIRST
+    const videoSent = await sendReelVideoToTelegram(
       ctx,
       reelMedia.mediaUrl,
       reelMedia.id || shortcode,
       downloadedBuffer
     );
 
-    // 4. Update status message to indicate music recognition step
+    if (!videoSent) {
+      logger.error('Telegram video send failed');
+    }
+
+    // Step 4: ONLY AFTER video send completion, update status to 🔍 Musiqa aniqlanmoqda...
     if (statusMsg) {
       await ctx.api.editMessageText(
         ctx.chat!.id,
@@ -177,7 +194,7 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       ).catch(() => {});
     }
 
-    // 5. Save job data to cache
+    // Save job to cache
     const jobId = generateJobId();
     await saveReelJob({
       jobId,
@@ -187,10 +204,10 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       createdAt: Date.now(),
     });
 
-    // 6. Perform music recognition using the pre-downloaded Buffer (or media URL)
+    // Step 5: Perform ACRCloud music recognition (only after video sending completed)
     const song = await identifySong(downloadedBuffer || reelMedia.mediaUrl);
 
-    // 7. Format success message
+    // Step 6: Send recognized music information
     let successMessage = '🎵 *MUSIQA TOPILDI*\n\n';
     successMessage += `🎤 *Artist:* ${escapeMarkdown(song.artist)}\n`;
     successMessage += `🎵 *Track:* ${escapeMarkdown(song.title)}\n`;
