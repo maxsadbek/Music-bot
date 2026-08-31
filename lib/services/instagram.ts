@@ -86,39 +86,30 @@ export function sanitizeForLog(obj: unknown): unknown {
  * Separated cleanly so provider implementations can be swapped without touching bot logic.
  */
 export async function getInstagramReel(url: string): Promise<InstagramReelMedia> {
-  logger.info('[IG DEBUG] getInstagramReel called with URL:', url);
-  
   const { shortcode, normalizedUrl } = validateAndNormalizeInstagramUrl(url);
-  logger.info('[IG DEBUG] SocialKit request starting');
 
   const apiUrl = process.env.INSTAGRAM_API_URL;
   const apiKey = process.env.INSTAGRAM_API_KEY;
 
+  logger.info('[IG] Instagram request started', {
+    shortcode,
+    instagramApiUrlConfigured: !!apiUrl,
+    instagramApiKeyConfigured: !!apiKey,
+  });
+
   if (!apiUrl) {
-    logger.error('[IG DEBUG] INSTAGRAM_API_URL is not defined in environment variables');
-    logger.warn('INSTAGRAM_API_URL is not defined in environment variables');
     throw new InstagramApiError('Instagram API endpoint is not configured. Please set INSTAGRAM_API_URL in environment.');
   }
 
   if (!apiKey) {
-    logger.error('[IG DEBUG] INSTAGRAM_API_KEY is not configured');
     throw new InstagramApiError('Instagram API key is not configured. Please set INSTAGRAM_API_KEY in environment.');
   }
-
-  logger.info('[IG DEBUG] Instagram API request started');
-  logger.info('[IG DEBUG] Instagram API key configured: true');
-  logger.info('[IG DEBUG] SocialKit API URL:', apiUrl);
-  logger.info('[IG DEBUG] Normalized Instagram URL:', normalizedUrl);
-  logger.info('[IG DEBUG] Shortcode:', shortcode);
 
   try {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'x-access-key': apiKey,
     };
-
-    logger.info('[IG DEBUG] Sending POST request to SocialKit');
-    logger.info('[IG DEBUG] Headers:', Object.keys(headers));
 
     const response = await axios.post(apiUrl, {
       url: normalizedUrl,
@@ -129,53 +120,19 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
       headers,
       timeout: 12000,
     });
-    logger.info('[IG DEBUG] Instagram API response status:', response.status);
-    logger.info('[IG DEBUG] SocialKit request completed');
+
+    logger.info('[IG] Instagram API response status:', response.status);
+    logger.info('[IG] Instagram API response body:', sanitizeForLog(response.data));
 
     const data = response.data;
 
     if (!data) {
-      logger.error('[IG DEBUG] Empty response from SocialKit');
       throw new InstagramApiError('Empty response from Instagram extraction service.');
     }
-
-    // Add diagnostic logging for SocialKit response structure
-    logger.info('[IG DEBUG] SocialKit HTTP status:', response.status);
-    logger.info('[IG DEBUG] Response Content-Type:', response.headers?.['content-type'] || 'undefined');
-    logger.info('[IG DEBUG] Response top-level keys:', Object.keys(data));
-    
-    // Log nested object keys safely
-    const topLevelKeys = Object.keys(data);
-    for (const key of topLevelKeys) {
-      const value = data[key];
-      if (value && typeof value === 'object' && !Array.isArray(value)) {
-        logger.info(`[IG DEBUG] nested keys in ${key}:`, Object.keys(value));
-      } else if (Array.isArray(value)) {
-        logger.info(`[IG DEBUG] ${key} is an array with ${value.length} items`);
-        if (value.length > 0 && typeof value[0] === 'object') {
-          logger.info(`[IG DEBUG] first item keys in ${key}:`, Object.keys(value[0]));
-        }
-      }
-    }
-
-    // Log provider status/message/error fields
-    if (data.status) {
-      logger.info('[IG DEBUG] Provider status field:', data.status);
-    }
-    if (data.message) {
-      logger.info('[IG DEBUG] Provider message field:', data.message);
-    }
-    if (data.error) {
-      logger.info('[IG DEBUG] Provider error field:', data.error);
-    }
-
-    // Log SocialKit response structure safely without logging API keys
-    logger.info('[IG DEBUG] Full sanitized response:', sanitizeForLog(data));
 
     // Flexible extraction mapping to support SocialKit API responses.
     // SocialKit returns { success, data: { downloadUrl, title, ... } }.
     // Also handles legacy flat response shapes for backward compatibility.
-    logger.info('[IG DEBUG] Starting flexible media URL extraction');
 
     const nested = data.data && typeof data.data === 'object' ? data.data : null;
 
@@ -217,30 +174,22 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
       data.caption ||
       (data.result && (data.result.title || data.result.caption));
 
-    logger.info('[IG DEBUG] Extraction results:', {
-      videoUrl: videoUrl ? 'found' : 'not found',
-      audioUrl: audioUrl ? 'found' : 'not found',
-      thumbnailUrl: thumbnailUrl ? 'found' : 'not found',
-      title: title ? 'found' : 'not found'
-    });
+    logger.info('[IG] Instagram media URLs extracted:', videoUrl ? 1 : 0);
 
     if (!videoUrl) {
-      logger.error('[IG DEBUG] No video URL found in response');
+      logger.error('[IG] No video URL found in response');
       const msg = (data.message || data.error || '').toLowerCase();
       if (
-        data.status === 404 ||
         msg.includes('private') ||
         msg.includes('deleted') ||
+        msg.includes('unavailable') ||
         (msg.includes('reel') && msg.includes('not found'))
       ) {
-        logger.error('[IG DEBUG] Explicit private/not found indicators - throwing PrivateOrDeletedReelError');
+        logger.error('[IG] Provider explicitly reports reel as private/deleted/unavailable');
         throw new PrivateOrDeletedReelError();
       }
-      logger.error('[IG DEBUG] No explicit private indicators - throwing InstagramApiError');
       throw new InstagramApiError('Could not find downloadable media URL in response.');
     }
-
-    logger.info('[IG DEBUG] Instagram direct media URL received:', { shortcode, mediaUrl: videoUrl });
 
     return {
       id: shortcode,
@@ -250,33 +199,36 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
       thumbnailUrl: thumbnailUrl || undefined,
     };
   } catch (error: unknown) {
-    logger.error('[IG DEBUG] ERROR name:', error instanceof Error ? error.constructor.name : 'Unknown');
-    logger.error('[IG DEBUG] ERROR message:', error instanceof Error ? error.message : String(error));
-    
     if (
       error instanceof PrivateOrDeletedReelError ||
       error instanceof InstagramApiError
     ) {
-      logger.error('[IG DEBUG] Re-throwing known error type');
       throw error;
     }
 
     if (axios.isAxiosError(error)) {
       const status = error.response?.status;
-      const errorMsg = error.response?.data?.message || error.message;
+      const providerMsg = error.response?.data?.message || error.response?.data?.error || error.message;
 
-      logger.error(`[IG DEBUG] Instagram API HTTP error [${status}]`, errorMsg);
+      logger.error(`[IG] Instagram API HTTP ${status || 'unknown'}`, providerMsg);
 
-      if (status === 404 || status === 403) {
-        logger.error('[IG DEBUG] HTTP 404/403 - throwing PrivateOrDeletedReelError');
+      // Only treat as private/deleted when the provider explicitly says so.
+      // Do NOT blindly convert 403/404 — those may be auth or rate-limit errors.
+      const lowerMsg = (providerMsg || '').toLowerCase();
+      if (
+        lowerMsg.includes('private') ||
+        lowerMsg.includes('deleted') ||
+        lowerMsg.includes('unavailable') ||
+        (lowerMsg.includes('reel') && lowerMsg.includes('not found'))
+      ) {
+        logger.error('[IG] Provider explicitly reports reel as private/deleted/unavailable');
         throw new PrivateOrDeletedReelError();
       }
 
-      logger.error('[IG DEBUG] HTTP error but not 404/403 - throwing InstagramApiError');
-      throw new InstagramApiError(`Extraction provider returned HTTP ${status || 'error'}: ${errorMsg}`);
+      throw new InstagramApiError(`Extraction provider returned HTTP ${status || 'error'}: ${providerMsg}`);
     }
 
-    logger.error('[IG DEBUG] Unexpected error fetching Instagram Reel from SocialKit', error);
+    logger.error('[IG] Unexpected error fetching Instagram Reel', error);
     throw new InstagramApiError('Failed to retrieve Instagram Reel media.');
   }
 }
