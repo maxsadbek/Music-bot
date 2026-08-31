@@ -54,9 +54,62 @@ describe('Audio Source Service', () => {
     );
   });
 
-  it('should throw AudioSourceError when no search results are found', async () => {
+  it('should fall back to JioSaavn direct API when saavn.dev returns no results', async () => {
+    // saavn.dev returns empty results
     vi.mocked(axios.get).mockResolvedValueOnce({
       data: { data: { results: [] } },
+    } as never);
+
+    // JioSaavn direct returns results
+    const mockJioResponse = {
+      data: {
+        results: [
+          {
+            song: 'United In Grief',
+            singers: 'Kendrick Lamar',
+            duration: '275',
+            download_url: [
+              { link: 'https://cdn2.example.com/low.mp3', quality: 'low' },
+              { link: 'https://cdn2.example.com/high.mp3', quality: 'high' },
+            ],
+          },
+        ],
+      },
+    };
+
+    const mockAudioBuffer = Buffer.from('mock-jio-mp3-bytes');
+
+    vi.mocked(axios.get)
+      .mockResolvedValueOnce(mockJioResponse as never)
+      .mockResolvedValueOnce({ data: mockAudioBuffer } as never);
+
+    const result = await getSongAudio('United In Grief', 'Kendrick Lamar');
+
+    expect(result.title).toBe('United In Grief');
+    expect(result.artist).toBe('Kendrick Lamar');
+    expect(result.buffer).toEqual(mockAudioBuffer);
+
+    // Should have called both saavn.dev and jiosaavn.com
+    expect(axios.get).toHaveBeenCalledTimes(3);
+    expect(axios.get).toHaveBeenNthCalledWith(
+      1,
+      expect.stringContaining('saavn.dev/api/search/songs'),
+      expect.anything()
+    );
+    expect(axios.get).toHaveBeenNthCalledWith(
+      2,
+      'https://www.jiosaavn.com/api.php',
+      expect.anything()
+    );
+  });
+
+  it('should throw AudioSourceError when no search results are found from any provider', async () => {
+    // Both providers return empty results
+    vi.mocked(axios.get).mockResolvedValueOnce({
+      data: { data: { results: [] } },
+    } as never);
+    vi.mocked(axios.get).mockResolvedValueOnce({
+      data: { results: [] },
     } as never);
 
     await expect(getSongAudio('Unknown Track', 'Unknown Artist')).rejects.toThrow(

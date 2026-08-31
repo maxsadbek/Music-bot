@@ -134,6 +134,10 @@ describe('Telegram Bot Handlers', () => {
 
   describe('handleTextMessage', () => {
     it('should process Instagram Reel URL, recognize song, and send ONE video message with caption and button', async () => {
+      vi.spyOn(cacheService, 'getCachedJobByShortcode').mockResolvedValue(null);
+      vi.spyOn(cacheService, 'cacheJobByShortcode').mockResolvedValue(undefined);
+      vi.spyOn(cacheService, 'saveReelJob').mockResolvedValue('mock-job-id');
+
       const mockCtx = {
         from: { id: 999 },
         message: { text: 'https://www.instagram.com/reel/DRU4smMj0cu/' },
@@ -164,35 +168,32 @@ describe('Telegram Bot Handlers', () => {
 
       await handleTextMessage(mockCtx);
 
-      // Status message sent
-      expect(mockCtx.reply).toHaveBeenCalledWith('⏳ Video va musiqa yuklanmoqda...');
+      // Status message sent with new format
+      expect(mockCtx.reply).toHaveBeenCalledWith('🎬 Reel qabul qilindi\n⏳ Video olinmoqda...');
 
       // ONE sendVideo call with caption containing full date
       expect(mockCtx.api.sendVideo).toHaveBeenCalledTimes(1);
-      expect(mockCtx.api.sendVideo).toHaveBeenCalledWith(
-        12345,
-        'https://cdn.socialkit.dev/video.mp4',
-        expect.objectContaining({
-          caption: expect.stringContaining('13 May 2022'),
-          parse_mode: 'Markdown',
-          reply_markup: expect.objectContaining({
-            inline_keyboard: expect.arrayContaining([
-              expect.arrayContaining([
-                expect.objectContaining({
-                  text: '🎧 QO‘SHIQNI OLISH',
-                  callback_data: expect.stringMatching(/^get_song:[a-f0-9]+$/),
-                }),
-              ]),
-            ]),
-          }),
-        })
-      );
+      const sendVideoCall = mockCtx.api.sendVideo.mock.calls[0];
+      expect(sendVideoCall[0]).toBe(12345);
+      expect(sendVideoCall[1]).toBe('https://cdn.socialkit.dev/video.mp4');
+      const options = sendVideoCall[2];
+      expect(options.caption).toContain('13 May 2022');
+      expect(options.parse_mode).toBe('Markdown');
+      // reply_markup is an InlineKeyboard instance
+      const keyboard = options.reply_markup;
+      expect(keyboard.inline_keyboard).toBeDefined();
+      expect(keyboard.inline_keyboard[0][0].text).toBe('🎧 QO\u2018SHIQNI OLISH');
+      expect(keyboard.inline_keyboard[0][0].callback_data).toMatch(/^get_song:[a-f0-9]+$/);
 
       // Status message cleaned up
       expect(mockCtx.api.deleteMessage).toHaveBeenCalledWith(12345, 100);
     });
 
     it('should send video with fallback caption when music recognition finds no match', async () => {
+      vi.spyOn(cacheService, 'getCachedJobByShortcode').mockResolvedValue(null);
+      vi.spyOn(cacheService, 'cacheJobByShortcode').mockResolvedValue(undefined);
+      vi.spyOn(cacheService, 'saveReelJob').mockResolvedValue('mock-job-id');
+
       const mockCtx = {
         from: { id: 999 },
         message: { text: 'https://www.instagram.com/reel/DRU4smMj0cu/' },
@@ -223,6 +224,48 @@ describe('Telegram Bot Handlers', () => {
         })
       );
     });
+
+    it('should reuse existing recognition when same shortcode is sent again', async () => {
+      const existingJob = {
+        jobId: 'existing123',
+        reelUrl: 'https://www.instagram.com/reel/DRU4smMj0cu/',
+        mediaUrl: 'https://cdn.socialkit.dev/video.mp4',
+        shortcode: 'DRU4smMj0cu',
+        createdAt: Date.now(),
+        songTitle: 'United In Grief',
+        songArtist: 'Kendrick Lamar',
+        songAlbum: 'Mr. Morale & The Big Steppers',
+        songReleaseDate: '2022-05-13',
+      };
+      vi.spyOn(cacheService, 'getCachedJobByShortcode').mockResolvedValueOnce(existingJob);
+
+      const mockCtx = {
+        from: { id: 999 },
+        message: { text: 'https://www.instagram.com/reel/DRU4smMj0cu/' },
+        chat: { id: 12345 },
+        reply: vi.fn().mockResolvedValue({ message_id: 100 }),
+        api: {
+          sendVideo: vi.fn().mockResolvedValue({ message_id: 101 }),
+          deleteMessage: vi.fn().mockResolvedValue(true),
+        },
+      } as unknown as Context;
+
+      await handleTextMessage(mockCtx);
+
+      // Should NOT call Instagram or ACRCloud
+      expect(instagramService.getInstagramReel).not.toHaveBeenCalled();
+      expect(musicService.identifySong).not.toHaveBeenCalled();
+
+      // Should send video with existing recognition
+      expect(mockCtx.api.sendVideo).toHaveBeenCalledTimes(1);
+      expect(mockCtx.api.sendVideo).toHaveBeenCalledWith(
+        12345,
+        'https://cdn.socialkit.dev/video.mp4',
+        expect.objectContaining({
+          caption: expect.stringContaining('United In Grief'),
+        })
+      );
+    });
   });
 
   describe('handleCallbackQuery - get_song', () => {
@@ -235,6 +278,7 @@ describe('Telegram Bot Handlers', () => {
         createdAt: Date.now(),
         songTitle: 'United In Grief',
         songArtist: 'Kendrick Lamar',
+        userId: 999,
       };
       vi.spyOn(cacheService, 'getReelJob').mockResolvedValueOnce(mockJob);
 
@@ -295,6 +339,82 @@ describe('Telegram Bot Handlers', () => {
         12345,
         expect.stringContaining('topilmadi')
       );
+    });
+
+    it('should reject callback from unauthorized user', async () => {
+      const mockJob = {
+        jobId: 'abc123',
+        reelUrl: 'https://www.instagram.com/reel/DRU4smMj0cu/',
+        mediaUrl: 'https://cdn.socialkit.dev/video.mp4',
+        shortcode: 'DRU4smMj0cu',
+        createdAt: Date.now(),
+        songTitle: 'United In Grief',
+        songArtist: 'Kendrick Lamar',
+        userId: 999, // Original user
+      };
+      vi.spyOn(cacheService, 'getReelJob').mockResolvedValueOnce(mockJob);
+
+      const mockCtx = {
+        from: { id: 1111 }, // Different user trying to access
+        callbackQuery: {
+          data: 'get_song:abc123',
+          message: { chat: { id: 12345 }, message_id: 200 },
+        },
+        answerCallbackQuery: vi.fn().mockResolvedValue(true),
+        api: {
+          sendMessage: vi.fn().mockResolvedValue({ message_id: 201 }),
+        },
+      } as unknown as Context;
+
+      await handleCallbackQuery(mockCtx);
+
+      expect(mockCtx.api.sendMessage).toHaveBeenCalledWith(
+        12345,
+        expect.stringContaining('so\'rovngiz emas')
+      );
+      // Should NOT attempt to download audio
+      expect(audioSource.getSongAudio).not.toHaveBeenCalled();
+    });
+
+    it('should allow callback when job has no userId set (backward compatibility)', async () => {
+      const mockJob = {
+        jobId: 'abc123',
+        reelUrl: 'https://www.instagram.com/reel/DRU4smMj0cu/',
+        mediaUrl: 'https://cdn.socialkit.dev/video.mp4',
+        shortcode: 'DRU4smMj0cu',
+        createdAt: Date.now(),
+        songTitle: 'Test Song',
+        songArtist: 'Test Artist',
+        // No userId set (old job format)
+      };
+      vi.spyOn(cacheService, 'getReelJob').mockResolvedValueOnce(mockJob);
+
+      const mockAudio = {
+        buffer: Buffer.from('mock audio data'),
+        title: 'Test Song',
+        artist: 'Test Artist',
+        durationSeconds: 180,
+      };
+      vi.spyOn(audioSource, 'getSongAudio').mockResolvedValueOnce(mockAudio);
+
+      const mockCtx = {
+        from: { id: 1111 },
+        callbackQuery: {
+          data: 'get_song:abc123',
+          message: { chat: { id: 12345 }, message_id: 200 },
+        },
+        answerCallbackQuery: vi.fn().mockResolvedValue(true),
+        api: {
+          sendMessage: vi.fn().mockResolvedValue({ message_id: 201 }),
+          sendAudio: vi.fn().mockResolvedValue({ message_id: 202 }),
+        },
+      } as unknown as Context;
+
+      await handleCallbackQuery(mockCtx);
+
+      // Should proceed with audio download (no userId to check against)
+      expect(audioSource.getSongAudio).toHaveBeenCalledWith('Test Song', 'Test Artist');
+      expect(mockCtx.api.sendAudio).toHaveBeenCalled();
     });
   });
 });

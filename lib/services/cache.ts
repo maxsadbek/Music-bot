@@ -10,6 +10,10 @@ export interface ReelJobData {
   createdAt: number;
   songTitle?: string;
   songArtist?: string;
+  songAlbum?: string;
+  songReleaseDate?: string;
+  userId?: number;
+  chatId?: number;
 }
 
 class MemoryStore {
@@ -30,6 +34,9 @@ class MemoryStore {
     return item.data;
   }
 }
+
+// Shortcode cache for duplicate detection (in-memory only, per-instance)
+const shortcodeMemoryCache = new Map<string, { jobId: string; expiresAt: number }>();
 
 const memoryCache = new MemoryStore();
 let warnedMissingRedis = false;
@@ -106,4 +113,29 @@ export async function getReelJob(jobId: string): Promise<ReelJobData | null> {
 
   // Memory cache fallback
   return memoryCache.get(key);
+}
+
+/**
+ * Caches a job ID by Instagram shortcode for duplicate detection.
+ * TTL: 10 minutes — enough to catch rapid duplicate sends without stale data.
+ */
+export async function cacheJobByShortcode(shortcode: string, jobId: string): Promise<void> {
+  const ttlMs = 10 * 60 * 1000;
+  shortcodeMemoryCache.set(shortcode, { jobId, expiresAt: Date.now() + ttlMs });
+}
+
+/**
+ * Looks up a recent job by Instagram shortcode for duplicate detection.
+ * Returns the full job data if found and not expired, null otherwise.
+ */
+export async function getCachedJobByShortcode(shortcode: string): Promise<ReelJobData | null> {
+  const cached = shortcodeMemoryCache.get(shortcode);
+  if (!cached) return null;
+
+  if (Date.now() > cached.expiresAt) {
+    shortcodeMemoryCache.delete(shortcode);
+    return null;
+  }
+
+  return await getReelJob(cached.jobId);
 }

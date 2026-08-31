@@ -17,7 +17,7 @@ describe('Error Handling and Formatting', () => {
 
   it('should format PrivateOrDeletedReelError correctly', () => {
     const err = new PrivateOrDeletedReelError();
-    expect(formatErrorMessage(err)).toBe('❌ Bu Reel\'ga kirib bo‘lmadi.');
+    expect(formatErrorMessage(err)).toBe("❌ Bu Reel'ga kirib bo'lmadi.");
   });
 
   it('should format InstagramApiError correctly', () => {
@@ -32,16 +32,16 @@ describe('Error Handling and Formatting', () => {
 
   it('should format MusicRecognitionApiError correctly', () => {
     const err = new MusicRecognitionApiError();
-    expect(formatErrorMessage(err)).toContain('⚠️ Musiqa xizmatiga bog‘lanishda xatolik yuz berdi.');
+    expect(formatErrorMessage(err)).toContain("⚠️ Musiqa xizmatiga bog'lanishda xatolik yuz berdi.");
   });
 
   it('should format RateLimitError correctly', () => {
     const err = new RateLimitError();
-    expect(formatErrorMessage(err)).toContain('⏳ Juda ko‘p so‘rov yuborildi.');
+    expect(formatErrorMessage(err)).toContain("⏳ Juda ko'p so'rov yuborildi.");
   });
 
   it('should format unknown generic errors gracefully', () => {
     const err = new Error('Unexpected crash');
-    expect(formatErrorMessage(err)).toBe('⚠️ Kutilmagan xatolik yuz berdi. Keyinroq qayta urinib ko‘ring.');
+    expect(formatErrorMessage(err)).toBe("⚠️ Kutilmagan xatolik yuz berdi. Keyinroq qayta urinib ko'ring.");
   });
 });
