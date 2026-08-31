@@ -1,11 +1,11 @@
-import { Context } from 'grammy';
+import { Context, InputFile } from 'grammy';
 import { logger } from '../utils/logger';
 import {
   extractInstagramUrlFromText,
   validateAndNormalizeInstagramUrl,
 } from '../validation/instagram';
 import { getInstagramReel } from '../services/instagram';
-import { identifySong, SongResult } from '../services/music-recognition';
+import { downloadMediaBuffer, identifySong, SongResult } from '../services/music-recognition';
 import { generateJobId, getReelJob, ReelJobData, saveReelJob } from '../services/cache';
 import { checkRateLimit } from '../services/rate-limit';
 import {
@@ -20,8 +20,54 @@ import {
 } from '../utils/errors';
 
 /**
+ * Sends Instagram Reel video to Telegram chat.
+ * Tries direct media URL first; falls back to uploading Buffer via InputFile if URL fails.
+ */
+export async function sendReelVideoToTelegram(
+  ctx: Context,
+  mediaUrl: string,
+  shortcode: string,
+  buffer?: Buffer
+): Promise<boolean> {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return false;
+
+  // 1. Attempt sending by URL directly first
+  try {
+    logger.info('Sending video to Telegram by URL', { mediaUrl });
+    await ctx.api.sendVideo(chatId, mediaUrl);
+    logger.info('Video sent successfully via direct URL');
+    return true;
+  } catch (urlError) {
+    logger.warn('Failed to send video to Telegram via URL. Falling back to Buffer upload...', urlError);
+  }
+
+  // 2. Fallback: Buffer upload via InputFile
+  try {
+    let videoBuf = buffer;
+    if (!videoBuf) {
+      videoBuf = await downloadMediaBuffer(mediaUrl);
+    }
+
+    if (videoBuf.length > 50 * 1024 * 1024) {
+      logger.warn('Video exceeds Telegram 50MB bot upload limit', { size: videoBuf.length });
+      return false;
+    }
+
+    const filename = `${shortcode || 'reel'}.mp4`;
+    logger.info('Sending video to Telegram via InputFile Buffer upload', { filename, size: videoBuf.length });
+    await ctx.api.sendVideo(chatId, new InputFile(videoBuf, filename));
+    logger.info('Video sent successfully via Buffer upload');
+    return true;
+  } catch (bufError) {
+    logger.error('Failed to send video to Telegram via Buffer upload', bufError);
+    return false;
+  }
+}
+
+/**
  * Re-fetches fresh Instagram media URL if initial recognition fails due to expired CDN link,
- * then retries AudD music recognition.
+ * then retries ACRCloud music recognition.
  */
 export async function refreshAndIdentify(job: ReelJobData): Promise<SongResult> {
   try {
@@ -103,8 +149,35 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
 
     statusMsg = await ctx.reply('🎬 Reel received\n\n⏳ Getting the video...');
 
+    // 1. Fetch direct media URL from SocialKit
     const reelMedia = await getInstagramReel(normalizedUrl);
 
+    // 2. Download media Buffer once to reuse for both Telegram video upload and ACRCloud recognition
+    let downloadedBuffer: Buffer | undefined;
+    try {
+      downloadedBuffer = await downloadMediaBuffer(reelMedia.mediaUrl);
+    } catch (downloadErr) {
+      logger.warn('Pre-downloading media buffer failed, fallback to URL download for recognition', downloadErr);
+    }
+
+    // 3. Send video to Telegram
+    await sendReelVideoToTelegram(
+      ctx,
+      reelMedia.mediaUrl,
+      reelMedia.id || shortcode,
+      downloadedBuffer
+    );
+
+    // 4. Update status message to indicate music recognition step
+    if (statusMsg) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        statusMsg.message_id,
+        '🔍 Musiqa aniqlanmoqda...'
+      ).catch(() => {});
+    }
+
+    // 5. Save job data to cache
     const jobId = generateJobId();
     await saveReelJob({
       jobId,
@@ -114,14 +187,40 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       createdAt: Date.now(),
     });
 
-    await ctx.api.editMessageText(
-      ctx.chat!.id,
-      statusMsg.message_id,
-      '✅ Video found!',
-      {
-        reply_markup: buildFindMusicKeyboard(jobId),
-      }
-    );
+    // 6. Perform music recognition using the pre-downloaded Buffer (or media URL)
+    const song = await identifySong(downloadedBuffer || reelMedia.mediaUrl);
+
+    // 7. Format success message
+    let successMessage = '🎵 *MUSIQA TOPILDI*\n\n';
+    successMessage += `🎤 *Artist:* ${escapeMarkdown(song.artist)}\n`;
+    successMessage += `🎵 *Track:* ${escapeMarkdown(song.title)}\n`;
+    if (song.album) {
+      successMessage += `💿 *Album:* ${escapeMarkdown(song.album)}\n`;
+    }
+    if (song.releaseDate) {
+      successMessage += `📅 *Released:* ${escapeMarkdown(song.releaseDate)}\n`;
+    }
+
+    const keyboard = buildSongLinksKeyboard(song);
+
+    if (statusMsg) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        statusMsg.message_id,
+        successMessage,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: keyboard,
+        }
+      );
+    } else {
+      await ctx.reply(successMessage, {
+        parse_mode: 'Markdown',
+        reply_markup: keyboard,
+      });
+    }
+
+    logger.info('Telegram response sent', { jobId });
   } catch (error: unknown) {
     logger.error('Error handling Instagram Reel URL', error);
     const userError = formatErrorMessage(error);
@@ -187,7 +286,7 @@ export async function handleCallbackQuery(ctx: Context): Promise<void> {
       // Use refreshAndIdentify to handle potentially expired media URLs on retry
       const song = await refreshAndIdentify(job);
 
-      let successMessage = '🎵 *MUSIQА TOPILDI*\n\n';
+      let successMessage = '🎵 *MUSIQA TOPILDI*\n\n';
       successMessage += `🎤 *Artist:* ${escapeMarkdown(song.artist)}\n`;
       successMessage += `🎵 *Track:* ${escapeMarkdown(song.title)}\n`;
       if (song.album) {
@@ -231,3 +330,4 @@ export async function handleCallbackQuery(ctx: Context): Promise<void> {
 function escapeMarkdown(text: string): string {
   return text.replace(/[_*`\[\]]/g, '\\$&');
 }
+
