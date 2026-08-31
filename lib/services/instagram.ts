@@ -129,6 +129,13 @@ function extractMediaUrls(responseBody: any): { videoUrl?: string; audioUrl?: st
         payload.video,
         payload.src,
         payload.link,
+        payload.url,
+        payload.file,
+        payload.file_url,
+        payload.fileUrl,
+        payload.content,
+        payload.content_url,
+        payload.contentUrl,
       ];
       for (const cand of videoFields) {
         if (isValidMediaUrl(cand)) {
@@ -168,7 +175,8 @@ function extractMediaUrls(responseBody: any): { videoUrl?: string; audioUrl?: st
     }
 
     // 4. Fallback to generic 'url' field ONLY if it is a valid direct media URL (not an Instagram page URL!)
-    if (!videoUrl && isValidMediaUrl(payload.url)) {
+    // (Note: url is already checked in videoFields above, this is a safety fallback for edge cases)
+    if (!videoUrl && payload.url && isValidMediaUrl(payload.url)) {
       videoUrl = payload.url;
     }
   }
@@ -212,6 +220,21 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
       throw new InstagramApiError('Empty response from SocialKit Instagram service.');
     }
 
+    // Add diagnostic logging for SocialKit response structure
+    logger.info('[Instagram] SocialKit response received');
+    logger.info('[Instagram] status:', response.status);
+    logger.info('[Instagram] Content-Type:', response.headers?.['content-type'] || 'undefined');
+    logger.info('[Instagram] top-level keys:', Object.keys(data));
+    
+    // Log nested object keys safely
+    const topLevelKeys = Object.keys(data);
+    for (const key of topLevelKeys) {
+      const value = data[key];
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        logger.info(`[Instagram] nested keys in ${key}:`, Object.keys(value));
+      }
+    }
+
     // Log SocialKit response structure safely without logging API keys
     logger.info('SocialKit response received', { response: sanitizeForLog(data) });
 
@@ -220,17 +243,44 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
       logger.error('SocialKit API error response:', msg);
 
       const msgLower = String(msg).toLowerCase();
-      if (
-        msgLower.includes('private') ||
-        msgLower.includes('not found') ||
-        msgLower.includes('deleted')
-      ) {
+      
+      // Only throw PrivateOrDeletedReelError for explicit indicators of private/deleted Reels
+      const isExplicitlyPrivate = 
+        msgLower.includes('this account is private') ||
+        msgLower.includes('private account') ||
+        msgLower.includes('this reel is private');
+      
+      const isExplicitlyDeleted = 
+        msgLower.includes('deleted') &&
+        (msgLower.includes('reel') || msgLower.includes('post'));
+      
+      const isExplicitlyNotFound = 
+        (msgLower.includes('reel not found') || 
+         msgLower.includes('post not found') ||
+         msgLower.includes('page not found'));
+
+      if (isExplicitlyPrivate || isExplicitlyDeleted || isExplicitlyNotFound) {
         throw new PrivateOrDeletedReelError();
       }
+      
       throw new InstagramApiError(`SocialKit API error: ${msg}`);
     }
 
     const { videoUrl, audioUrl } = extractMediaUrls(data);
+
+    // Log media candidates and selected field
+    logger.info('[Instagram] media candidates:', { 
+      videoUrl: videoUrl ? 'found' : 'not found', 
+      audioUrl: audioUrl ? 'found' : 'not found' 
+    });
+    
+    if (videoUrl) {
+      logger.info('[Instagram] selected media field: video_url');
+    } else if (audioUrl) {
+      logger.info('[Instagram] selected media field: audio_url');
+    } else {
+      logger.info('[Instagram] selected media field: none found');
+    }
 
     const payload = data.data || data.result || data;
 
@@ -255,15 +305,30 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
         response: sanitizeForLog(data),
       });
 
+      // Only throw PrivateOrDeletedReelError if there's clear evidence the Reel is actually private/deleted
       const rawMsg = data.message || data.error || '';
       const msgLower = String(rawMsg).toLowerCase();
-      if (
-        data.status === 404 ||
-        msgLower.includes('private') ||
-        msgLower.includes('not found')
-      ) {
+      
+      // Check for explicit provider indicators that the Reel is private/deleted
+      const isExplicitlyPrivate = 
+        msgLower.includes('private account') ||
+        msgLower.includes('this account is private') ||
+        msgLower.includes('private reel');
+      
+      const isExplicitlyDeleted = 
+        msgLower.includes('deleted') &&
+        (msgLower.includes('reel') || msgLower.includes('post'));
+      
+      const isExplicitlyNotFound = 
+        (msgLower.includes('reel not found') || 
+         msgLower.includes('post not found') ||
+         msgLower.includes('page not found'));
+
+      if (isExplicitlyPrivate || isExplicitlyDeleted || isExplicitlyNotFound) {
         throw new PrivateOrDeletedReelError();
       }
+      
+      // Otherwise, it's a parsing/structure issue, not a private/deleted Reel
       throw new InstagramApiError('Could not find downloadable direct media URL in SocialKit response.');
     }
 
@@ -292,7 +357,23 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
       logger.error(`SocialKit Instagram API HTTP error [${status || 'network'}]`, errorMsg);
 
       const msgLower = String(errorMsg).toLowerCase();
-      if (status === 404 || status === 403 || msgLower.includes('private') || msgLower.includes('not found')) {
+      
+      // Only throw PrivateOrDeletedReelError for explicit indicators of private/deleted Reels
+      const isExplicitlyPrivate = 
+        msgLower.includes('this account is private') ||
+        msgLower.includes('private account') ||
+        msgLower.includes('this reel is private');
+      
+      const isExplicitlyDeleted = 
+        msgLower.includes('deleted') &&
+        (msgLower.includes('reel') || msgLower.includes('post'));
+      
+      const isExplicitlyNotFound = 
+        (msgLower.includes('reel not found') || 
+         msgLower.includes('post not found') ||
+         msgLower.includes('page not found'));
+
+      if ((status === 403 || status === 404) && (isExplicitlyPrivate || isExplicitlyDeleted || isExplicitlyNotFound)) {
         throw new PrivateOrDeletedReelError();
       }
 
