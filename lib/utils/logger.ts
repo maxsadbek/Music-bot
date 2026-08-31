@@ -6,7 +6,8 @@
 const SECRETS_TO_MASK = [
   process.env.TELEGRAM_BOT_TOKEN,
   process.env.TELEGRAM_WEBHOOK_SECRET,
-  process.env.AUDD_API_TOKEN,
+  process.env.ACRCLOUD_ACCESS_KEY,
+  process.env.ACRCLOUD_ACCESS_SECRET,
   process.env.INSTAGRAM_API_KEY,
   process.env.REDIS_URL,
   process.env.UPSTASH_REDIS_REST_TOKEN,

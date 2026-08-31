@@ -208,6 +208,8 @@ export async function handleCallbackQuery(ctx: Context): Promise<void> {
           reply_markup: keyboard,
         }
       );
+
+      logger.info('Telegram response sent', { chatId, messageId, jobId });
     } catch (error: unknown) {
       logger.error(`Music identification failed for job ${jobId}`, error);
       const userErrorMsg = formatErrorMessage(error);

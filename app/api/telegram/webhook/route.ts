@@ -6,7 +6,7 @@ export const dynamic = 'force-dynamic';
 
 /**
  * Configure maximum execution duration for Vercel Serverless Functions.
- * Necessary because Instagram media retrieval (up to 12s timeout) and AudD
+ * Necessary because Instagram media retrieval (up to 12s timeout) and ACRCloud
  * music recognition API (up to 20s timeout) can take upwards of 30+ seconds.
  * Note: Setting maxDuration > 10s requires Vercel Pro plan.
  */

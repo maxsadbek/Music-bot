@@ -30,7 +30,7 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
     throw new InstagramApiError('Instagram API access key is missing. Please set INSTAGRAM_API_KEY in environment.');
   }
 
-  logger.info(`Fetching Reel media for shortcode: ${shortcode}`);
+  logger.info('Instagram request started', { shortcode, url: normalizedUrl });
 
   try {
     const requestBody = {
@@ -121,6 +121,8 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
       }
       throw new InstagramApiError('Could not find downloadable media URL in SocialKit response.');
     }
+
+    logger.info('Instagram media URL received', { shortcode, mediaUrl: finalMediaUrl });
 
     return {
       id: shortcode,

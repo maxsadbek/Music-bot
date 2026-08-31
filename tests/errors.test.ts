@@ -27,7 +27,7 @@ describe('Error Handling and Formatting', () => {
 
   it('should format MusicNotFoundError correctly', () => {
     const err = new MusicNotFoundError();
-    expect(formatErrorMessage(err)).toContain('😔 Musiqani aniqlay olmadim.');
+    expect(formatErrorMessage(err)).toContain('🎵 Musiqa aniqlanmadi.');
   });
 
   it('should format MusicRecognitionApiError correctly', () => {

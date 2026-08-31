@@ -8,7 +8,7 @@ Musify is a production-ready Telegram Bot designed to identify music from Instag
 
 - **Instagram Reel URL Validation**: Validates and normalizes Instagram Reel links (`/reel/`, `/reels/`, `/p/`).
 - **Media Extraction Abstraction**: Swappable REST service layer for fetching downloadable audio/video links.
-- **Song Recognition**: Integrated with **AudD API** for track identification, returning artist, track, album, release date, and direct streaming links (Spotify, Apple Music).
+- **Song Recognition**: Integrated with **ACRCloud API** for track identification, returning artist, track, album, release date, and streaming links (Spotify).
 - **Clean Telegram UX**: Interactive inline callback buttons, dynamic message updates (avoiding chat spam), custom status emojis (🎬 ⏳ ✅ 🔍 🎵 🎤 💿 😔 ❌).
 - **Vercel Serverless Compatible**: Fully stateless webhooks designed to scale on Vercel without requiring a permanent VPS or local FFmpeg daemon.
 - **Redis Caching Support**: Upstash Redis primary job storage with in-memory cache for speed optimizations.
@@ -22,7 +22,7 @@ Musify is a production-ready Telegram Bot designed to identify music from Instag
 - **Language**: TypeScript
 - **Telegram Bot Engine**: grammY
 - **Validation**: Zod
-- **Music Recognition API**: AudD API
+- **Music Recognition API**: ACRCloud API
 - **Testing**: Vitest
 - **Deployment**: Vercel
 
@@ -36,7 +36,9 @@ Create a `.env.local` file in your root directory based on `.env.example`:
 | :--- | :--- | :---: |
 | `TELEGRAM_BOT_TOKEN` | Bot API token from [@BotFather](https://t.me/BotFather) | **Yes** |
 | `TELEGRAM_WEBHOOK_SECRET` | Secret token to authenticate Telegram webhook calls | Optional |
-| `AUDD_API_TOKEN` | API token from [AudD Music Recognition](https://audd.io/) | **Yes** |
+| `ACRCLOUD_HOST` | ACRCloud Identify host (e.g. `identify-eu-west-1.acrcloud.com`) | **Yes** |
+| `ACRCLOUD_ACCESS_KEY` | ACRCloud Access Key from console | **Yes** |
+| `ACRCLOUD_ACCESS_SECRET` | ACRCloud Access Secret from console | **Yes** |
 | `INSTAGRAM_API_URL` | HTTP endpoint URL for Instagram Reel downloader service | **Yes** |
 | `INSTAGRAM_API_KEY` | API Key for Instagram downloader service (e.g., RapidAPI) | Optional / Service dependent |
 | `UPSTASH_REDIS_REST_URL` | Upstash Redis REST URL for distributed jobs | Recommended |
@@ -48,7 +50,7 @@ Create a `.env.local` file in your root directory based on `.env.example`:
 ## ⚠️ Important Note on Vercel Plan Limits
 
 > [!IMPORTANT]
-> The webhook API route is configured with `export const maxDuration = 60;` to allow sufficient time for Instagram media retrieval (up to 12s) and AudD music recognition (up to 20s).
+> The webhook API route is configured with `export const maxDuration = 60;` to allow sufficient time for Instagram media retrieval (up to 12s) and ACRCloud music recognition (up to 20s).
 >
 > - **Vercel Hobby (Free)** plan caps serverless function execution at 10–15 seconds. If requests exceed 10s on Hobby, Vercel will time out the function.
 > - **Vercel Pro** is recommended for production deployments to support `maxDuration` up to 60 seconds.
@@ -61,9 +63,10 @@ Create a `.env.local` file in your root directory based on `.env.example`:
 1. Open Telegram and search for [@BotFather](https://t.me/BotFather).
 2. Send `/newbot` and follow instructions to get your `TELEGRAM_BOT_TOKEN`.
 
-### 2. AudD API Token
-1. Register at [audd.io](https://audd.io/).
-2. Copy your API token into `AUDD_API_TOKEN`.
+### 2. ACRCloud Credentials
+1. Register at [acrcloud.com](https://www.acrcloud.com/).
+2. Create an Audio & Video Recognition project.
+3. Copy `Host`, `Access Key`, and `Access Secret` into `ACRCLOUD_HOST`, `ACRCLOUD_ACCESS_KEY`, and `ACRCLOUD_ACCESS_SECRET`.
 
 ### 3. Instagram Media Downloader API
 1. Subscribe to an Instagram Reel Downloader REST API (e.g. via RapidAPI, Cobalt API, or custom extractor endpoint).
@@ -87,7 +90,7 @@ Create a `.env.local` file in your root directory based on `.env.example`:
 3. **Set up `.env.local`**:
    ```bash
    cp .env.example .env.local
-   # Fill in TELEGRAM_BOT_TOKEN, AUDD_API_TOKEN, INSTAGRAM_API_URL, INSTAGRAM_API_KEY
+   # Fill in TELEGRAM_BOT_TOKEN, ACRCLOUD_HOST, ACRCLOUD_ACCESS_KEY, ACRCLOUD_ACCESS_SECRET, INSTAGRAM_API_URL, INSTAGRAM_API_KEY
    ```
 
 4. **Start Next.js dev server**:

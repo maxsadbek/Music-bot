@@ -43,7 +43,7 @@ export class MusicNotFoundError extends AppError {
   constructor() {
     super(
       'Music could not be recognized from audio track',
-      '😔 Musiqani aniqlay olmadim.\n\nPossible reasons:\n• Audio juda qisqa\n• Audio sifati past\n• Original audio / unreleased audio\n• Background noise'
+      '🎵 Musiqa aniqlanmadi.\n\nEhtimoliy sabablar:\n• Audio juda qisqa\n• Audio sifati past\n• Original audio / nashr etilmagan musiqa\n• Shovqin yuqori'
     );
     this.name = 'MusicNotFoundError';
   }
