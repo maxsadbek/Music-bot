@@ -22,111 +22,137 @@ export interface InstagramReelMedia {
 export async function getInstagramReel(url: string): Promise<InstagramReelMedia> {
   const { shortcode, normalizedUrl } = validateAndNormalizeInstagramUrl(url);
 
-  const apiUrl = process.env.INSTAGRAM_API_URL;
+  const apiUrl = process.env.INSTAGRAM_API_URL || 'https://api.socialkit.dev/instagram/download';
   const apiKey = process.env.INSTAGRAM_API_KEY;
 
-  if (!apiUrl) {
-    logger.warn('INSTAGRAM_API_URL is not defined in environment variables');
-    throw new InstagramApiError('Instagram API endpoint is not configured. Please set INSTAGRAM_API_URL in environment.');
+  if (!apiKey) {
+    logger.warn('INSTAGRAM_API_KEY is not defined in environment variables');
+    throw new InstagramApiError('Instagram API access key is missing. Please set INSTAGRAM_API_KEY in environment.');
   }
 
   logger.info(`Fetching Reel media for shortcode: ${shortcode}`);
 
   try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
+    const requestBody = {
+      access_key: apiKey,
+      url: normalizedUrl,
+      format: 'mp3',
     };
 
-    if (apiKey) {
-      headers['X-RapidAPI-Key'] = apiKey;
-      headers['x-api-key'] = apiKey;
-      headers['Authorization'] = `Bearer ${apiKey}`;
-    }
-
-    const response = await axios.get(apiUrl, {
-      params: {
-        url: normalizedUrl,
-        shortcode,
+    const response = await axios.post(apiUrl, requestBody, {
+      headers: {
+        'Content-Type': 'application/json',
       },
-      headers,
-      timeout: 12000,
+      timeout: 15000,
     });
 
     const data = response.data;
 
     if (!data) {
-      throw new InstagramApiError('Empty response from Instagram extraction service.');
+      throw new InstagramApiError('Empty response from SocialKit Instagram service.');
     }
 
-    // Flexible extraction mapping to support standard RapidAPI & generic media APIs
-    const videoUrl =
-      data.video_url ||
-      data.media_url ||
-      data.url ||
-      data.download_url ||
-      (Array.isArray(data.urls) && data.urls[0]?.url) ||
-      (Array.isArray(data.data) && data.data[0]?.url) ||
-      (data.result && (data.result.video_url || data.result.url || data.result[0]?.url));
+    if (data.success === false || data.status === 'error') {
+      const msg = data.message || data.error || 'SocialKit API returned failure status';
+      logger.error('SocialKit API error response:', msg);
 
-    const audioUrl =
-      data.audio_url ||
-      data.music_url ||
-      (data.result && (data.result.audio_url || data.result.music_url));
-
-    const thumbnailUrl =
-      data.thumbnail_url ||
-      data.cover_url ||
-      data.thumbnail ||
-      (data.result && data.result.thumbnail);
-
-    const title =
-      data.title ||
-      data.caption ||
-      (data.result && (data.result.title || data.result.caption));
-
-    if (!videoUrl) {
-      // If videoUrl extraction fails and DEBUG_INSTAGRAM_API=true, log sanitized raw data
-      if (process.env.DEBUG_INSTAGRAM_API === 'true') {
-        logger.error('Failed to extract videoUrl from Instagram API response. Raw response:', JSON.stringify(data));
-      }
-
+      const msgLower = String(msg).toLowerCase();
       if (
-        data.status === 404 ||
-        data.error?.includes('private') ||
-        data.message?.includes('private') ||
-        data.message?.includes('not found')
+        msgLower.includes('private') ||
+        msgLower.includes('not found') ||
+        msgLower.includes('deleted')
       ) {
         throw new PrivateOrDeletedReelError();
       }
-      throw new InstagramApiError('Could not find downloadable media URL in response.');
+      throw new InstagramApiError(`SocialKit API error: ${msg}`);
+    }
+
+    const payload = data.data || data.result || data;
+
+    const videoUrl =
+      payload.video_url ||
+      payload.media_url ||
+      payload.url ||
+      payload.download_url ||
+      (Array.isArray(payload.urls) && (payload.urls[0]?.url || payload.urls[0])) ||
+      (Array.isArray(payload) && (payload[0]?.video_url || payload[0]?.url || payload[0]?.media_url)) ||
+      data.video_url ||
+      data.media_url ||
+      data.url ||
+      data.download_url;
+
+    const audioUrl =
+      payload.audio_url ||
+      payload.music_url ||
+      payload.audio ||
+      data.audio_url ||
+      data.music_url ||
+      data.audio;
+
+    const thumbnailUrl =
+      payload.thumbnail_url ||
+      payload.cover_url ||
+      payload.thumbnail ||
+      data.thumbnail_url ||
+      data.cover_url ||
+      data.thumbnail;
+
+    const title =
+      payload.title ||
+      payload.caption ||
+      data.title ||
+      data.caption;
+
+    const finalMediaUrl = videoUrl || audioUrl;
+
+    if (!finalMediaUrl) {
+      if (process.env.DEBUG_INSTAGRAM_API === 'true') {
+        logger.error('Failed to extract media URL from SocialKit API response. Raw response:', JSON.stringify(data));
+      }
+
+      const rawMsg = data.message || data.error || '';
+      const msgLower = String(rawMsg).toLowerCase();
+      if (
+        data.status === 404 ||
+        msgLower.includes('private') ||
+        msgLower.includes('not found')
+      ) {
+        throw new PrivateOrDeletedReelError();
+      }
+      throw new InstagramApiError('Could not find downloadable media URL in SocialKit response.');
     }
 
     return {
       id: shortcode,
-      mediaUrl: videoUrl,
+      mediaUrl: finalMediaUrl,
       audioUrl: audioUrl || undefined,
       title: title || undefined,
       thumbnailUrl: thumbnailUrl || undefined,
     };
   } catch (error: unknown) {
-    if (error instanceof PrivateOrDeletedReelError || error instanceof InstagramApiError) {
+    if (
+      error instanceof PrivateOrDeletedReelError ||
+      error instanceof InstagramApiError
+    ) {
       throw error;
     }
 
     if (axios.isAxiosError(error)) {
       const status = error.response?.status;
-      const errorMsg = error.response?.data?.message || error.message;
+      const responseData = error.response?.data;
+      const errorMsg = responseData?.message || responseData?.error || error.message;
 
-      logger.error(`Instagram API HTTP error [${status}]`, errorMsg);
+      logger.error(`SocialKit Instagram API HTTP error [${status || 'network'}]`, errorMsg);
 
-      if (status === 404 || status === 403) {
+      const msgLower = String(errorMsg).toLowerCase();
+      if (status === 404 || status === 403 || msgLower.includes('private') || msgLower.includes('not found')) {
         throw new PrivateOrDeletedReelError();
       }
 
-      throw new InstagramApiError(`Extraction provider returned HTTP ${status || 'error'}: ${errorMsg}`);
+      throw new InstagramApiError(`SocialKit API returned HTTP ${status || 'error'}: ${errorMsg}`);
     }
 
-    logger.error('Unexpected error fetching Instagram Reel', error);
+    logger.error('Unexpected error fetching Instagram Reel from SocialKit', error);
     throw new InstagramApiError('Failed to retrieve Instagram Reel media.');
   }
 }
