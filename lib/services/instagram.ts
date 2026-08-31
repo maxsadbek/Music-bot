@@ -100,34 +100,36 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
     throw new InstagramApiError('Instagram API endpoint is not configured. Please set INSTAGRAM_API_URL in environment.');
   }
 
+  if (!apiKey) {
+    logger.error('[IG DEBUG] INSTAGRAM_API_KEY is not configured');
+    throw new InstagramApiError('Instagram API key is not configured. Please set INSTAGRAM_API_KEY in environment.');
+  }
+
+  logger.info('[IG DEBUG] Instagram API request started');
+  logger.info('[IG DEBUG] Instagram API key configured: true');
   logger.info('[IG DEBUG] SocialKit API URL:', apiUrl);
   logger.info('[IG DEBUG] Normalized Instagram URL:', normalizedUrl);
   logger.info('[IG DEBUG] Shortcode:', shortcode);
-  logger.info('[IG DEBUG] API Key:', apiKey ? 'SET' : 'NOT SET');
 
   try {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
+      'x-access-key': apiKey,
     };
 
-    if (apiKey) {
-      headers['X-RapidAPI-Key'] = apiKey;
-      headers['x-api-key'] = apiKey;
-      headers['Authorization'] = `Bearer ${apiKey}`;
-    }
-
-    logger.info('[IG DEBUG] Sending GET request to SocialKit with query parameters');
-    logger.info('[IG DEBUG] Query params: { url:', normalizedUrl, ', shortcode:', shortcode, '}');
+    logger.info('[IG DEBUG] Sending POST request to SocialKit');
     logger.info('[IG DEBUG] Headers:', Object.keys(headers));
 
-    const response = await axios.get(apiUrl, {
-      params: {
-        url: normalizedUrl,
-        shortcode,
-      },
+    const response = await axios.post(apiUrl, {
+      url: normalizedUrl,
+      access_key: apiKey,
+      format: 'mp4',
+      quality: '720p',
+    }, {
       headers,
       timeout: 12000,
     });
+    logger.info('[IG DEBUG] Instagram API response status:', response.status);
     logger.info('[IG DEBUG] SocialKit request completed');
 
     const data = response.data;
@@ -170,31 +172,47 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
     // Log SocialKit response structure safely without logging API keys
     logger.info('[IG DEBUG] Full sanitized response:', sanitizeForLog(data));
 
-    // Flexible extraction mapping to support standard RapidAPI & generic media APIs
-    // Search for video/media URL in common response shapes:
+    // Flexible extraction mapping to support SocialKit API responses.
+    // SocialKit returns { success, data: { downloadUrl, title, ... } }.
+    // Also handles legacy flat response shapes for backward compatibility.
     logger.info('[IG DEBUG] Starting flexible media URL extraction');
-    
+
+    const nested = data.data && typeof data.data === 'object' ? data.data : null;
+
     const videoUrl =
+      (nested && nested.downloadUrl) ||
+      (nested && nested.video_url) ||
+      (nested && nested.media_url) ||
+      (nested && nested.url && !isInstagramPageUrl(nested.url) && nested.url) ||
       data.video_url ||
       data.media_url ||
-      data.url ||
+      (data.url && !isInstagramPageUrl(data.url) && data.url) ||
       data.download_url ||
+      data.file_url ||
+      data.content_url ||
       (Array.isArray(data.urls) && data.urls[0]?.url) ||
       (Array.isArray(data.data) && data.data[0]?.url) ||
-      (data.result && (data.result.video_url || data.result.url || data.result[0]?.url));
+      (data.result && (data.result.video_url || data.result.download_url || data.result.url || data.result[0]?.url)) ||
+      (data.result?.download?.url);
 
     const audioUrl =
+      (nested && nested.audio_url) ||
+      (nested && nested.music_url) ||
       data.audio_url ||
       data.music_url ||
       (data.result && (data.result.audio_url || data.result.music_url));
 
     const thumbnailUrl =
+      (nested && nested.thumbnail) ||
+      (nested && nested.thumbnail_url) ||
       data.thumbnail_url ||
       data.cover_url ||
       data.thumbnail ||
       (data.result && data.result.thumbnail);
 
     const title =
+      (nested && nested.title) ||
+      (nested && nested.caption) ||
       data.title ||
       data.caption ||
       (data.result && (data.result.title || data.result.caption));
@@ -208,11 +226,12 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
 
     if (!videoUrl) {
       logger.error('[IG DEBUG] No video URL found in response');
+      const msg = (data.message || data.error || '').toLowerCase();
       if (
         data.status === 404 ||
-        data.error?.includes('private') ||
-        data.message?.includes('private') ||
-        data.message?.includes('not found')
+        msg.includes('private') ||
+        msg.includes('deleted') ||
+        (msg.includes('reel') && msg.includes('not found'))
       ) {
         logger.error('[IG DEBUG] Explicit private/not found indicators - throwing PrivateOrDeletedReelError');
         throw new PrivateOrDeletedReelError();
