@@ -1,4 +1,4 @@
-import { Context, InputFile } from 'grammy';
+import { Context, InlineKeyboard, InputFile } from 'grammy';
 import { logger } from '../utils/logger';
 import {
   extractInstagramUrlFromText,
@@ -10,8 +10,8 @@ import { generateJobId, getReelJob, ReelJobData, saveReelJob } from '../services
 import { checkRateLimit } from '../services/rate-limit';
 import {
   buildFindMusicKeyboard,
+  buildGetSongKeyboard,
   buildRetryKeyboard,
-  buildSongLinksKeyboard,
 } from './keyboards';
 import {
   formatErrorMessage,
@@ -20,13 +20,33 @@ import {
 } from '../utils/errors';
 
 /**
- * Sends Instagram Reel video to Telegram chat.
+ * Formats song metadata into minimal, premium Telegram video caption.
+ */
+export function formatSongCaption(song: SongResult): string {
+  const title = escapeMarkdown(song.title);
+  const artist = escapeMarkdown(song.artist);
+  const album = song.album ? escapeMarkdown(song.album) : undefined;
+  const year = song.releaseDate ? song.releaseDate.slice(0, 4) : undefined;
+
+  let caption = `🎵 *${title}*\n   ${artist}`;
+  if (album || year) {
+    caption += `\n\n━━━━━━━━━━━━━━━━━━`;
+    if (album) caption += `\n💿 ${album}`;
+    if (year) caption += `\n📅 ${year}`;
+  }
+  return caption;
+}
+
+/**
+ * Sends Instagram Reel video to Telegram chat with caption and inline keyboard as ONE message.
  * Tries direct media URL first; falls back to uploading Buffer via InputFile if direct URL fails.
  */
 export async function sendReelVideoToTelegram(
   ctx: Context,
   mediaUrl: string,
   shortcode: string,
+  caption?: string,
+  replyMarkup?: InlineKeyboard,
   buffer?: Buffer
 ): Promise<boolean> {
   const chatId = ctx.chat?.id;
@@ -37,8 +57,12 @@ export async function sendReelVideoToTelegram(
 
   // 1. Attempt sending by direct URL first
   try {
-    logger.info('Sending video to Telegram by direct URL', { mediaUrl });
-    await ctx.api.sendVideo(chatId, mediaUrl);
+    logger.info('Sending video to Telegram by direct URL with caption', { mediaUrl });
+    await ctx.api.sendVideo(chatId, mediaUrl, {
+      caption,
+      parse_mode: 'Markdown',
+      reply_markup: replyMarkup,
+    });
     logger.info('Telegram video sent successfully via direct URL');
     return true;
   } catch (urlError) {
@@ -58,8 +82,12 @@ export async function sendReelVideoToTelegram(
     }
 
     const filename = `${shortcode || 'reel'}.mp4`;
-    logger.info('Sending video to Telegram via InputFile Buffer upload', { filename, size: videoBuf.length });
-    await ctx.api.sendVideo(chatId, new InputFile(videoBuf, filename));
+    logger.info('Sending video to Telegram via InputFile Buffer upload with caption', { filename, size: videoBuf.length });
+    await ctx.api.sendVideo(chatId, new InputFile(videoBuf, filename), {
+      caption,
+      parse_mode: 'Markdown',
+      reply_markup: replyMarkup,
+    });
     logger.info('Telegram video sent successfully via Buffer upload');
     return true;
   } catch (bufError) {
@@ -109,8 +137,7 @@ export async function handleHelp(ctx: Context): Promise<void> {
   const message =
     '1. Instagram Reel linkini yuboring.\n' +
     '2. Video topilishini kuting.\n' +
-    '3. 🎵 *Musiqani topish* tugmasini bosing.\n' +
-    '4. Musify qo‘shiqni aniqlaydi.';
+    '3. Musify qo‘shiqni aniqlaydi.';
 
   await ctx.reply(message, { parse_mode: 'Markdown' });
 }
@@ -150,22 +177,13 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
   try {
     const { normalizedUrl, shortcode } = validateAndNormalizeInstagramUrl(urlInText);
 
-    // Step 1: Status message 🎬 Reel qabul qilindi
-    statusMsg = await ctx.reply('🎬 Reel qabul qilindi\n\n⏳ Video olinmoqda...');
+    // Send temporary status message while fetching & recognizing
+    statusMsg = await ctx.reply('⏳ Video va musiqa yuklanmoqda...');
 
-    // Step 2: Fetch direct video media URL from SocialKit
+    // 1. Fetch direct video media URL from SocialKit
     const reelMedia = await getInstagramReel(normalizedUrl);
 
-    // Update status to 🎥 Video yuboriladi
-    if (statusMsg) {
-      await ctx.api.editMessageText(
-        ctx.chat!.id,
-        statusMsg.message_id,
-        '🎥 Video yuboriladi...'
-      ).catch(() => {});
-    }
-
-    // Pre-download media buffer once to reuse for both Telegram upload fallback and ACRCloud recognition
+    // 2. Pre-download media buffer once to reuse for both Telegram upload fallback and ACRCloud recognition
     let downloadedBuffer: Buffer | undefined;
     try {
       downloadedBuffer = await downloadMediaBuffer(reelMedia.mediaUrl);
@@ -173,28 +191,7 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       logger.warn('Pre-downloading media buffer failed, fallback to URL download for recognition', downloadErr);
     }
 
-    // Step 3: Send video to Telegram AND AWAIT COMPLETION FIRST
-    const videoSent = await sendReelVideoToTelegram(
-      ctx,
-      reelMedia.mediaUrl,
-      reelMedia.id || shortcode,
-      downloadedBuffer
-    );
-
-    if (!videoSent) {
-      logger.error('Telegram video send failed');
-    }
-
-    // Step 4: ONLY AFTER video send completion, update status to 🔍 Musiqa aniqlanmoqda...
-    if (statusMsg) {
-      await ctx.api.editMessageText(
-        ctx.chat!.id,
-        statusMsg.message_id,
-        '🔍 Musiqa aniqlanmoqda...'
-      ).catch(() => {});
-    }
-
-    // Save job to cache
+    // 3. Save job to cache
     const jobId = generateJobId();
     await saveReelJob({
       jobId,
@@ -204,40 +201,45 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       createdAt: Date.now(),
     });
 
-    // Step 5: Perform ACRCloud music recognition (only after video sending completed)
-    const song = await identifySong(downloadedBuffer || reelMedia.mediaUrl);
+    // 4. Perform ACRCloud music recognition
+    let captionText = '🎵 Musiqa aniqlanmadi.';
+    let keyboard: InlineKeyboard | undefined;
 
-    // Step 6: Send recognized music information
-    let successMessage = '🎵 *MUSIQA TOPILDI*\n\n';
-    successMessage += `🎤 *Artist:* ${escapeMarkdown(song.artist)}\n`;
-    successMessage += `🎵 *Track:* ${escapeMarkdown(song.title)}\n`;
-    if (song.album) {
-      successMessage += `💿 *Album:* ${escapeMarkdown(song.album)}\n`;
-    }
-    if (song.releaseDate) {
-      successMessage += `📅 *Released:* ${escapeMarkdown(song.releaseDate)}\n`;
-    }
-
-    const keyboard = buildSongLinksKeyboard(song);
-
-    if (statusMsg) {
-      await ctx.api.editMessageText(
-        ctx.chat!.id,
-        statusMsg.message_id,
-        successMessage,
-        {
-          parse_mode: 'Markdown',
-          reply_markup: keyboard,
-        }
-      );
-    } else {
-      await ctx.reply(successMessage, {
-        parse_mode: 'Markdown',
-        reply_markup: keyboard,
-      });
+    try {
+      const song = await identifySong(downloadedBuffer || reelMedia.mediaUrl);
+      captionText = formatSongCaption(song);
+      keyboard = buildGetSongKeyboard(jobId);
+    } catch (musicErr) {
+      if (musicErr instanceof MusicNotFoundError) {
+        logger.info('No music recognized for reel', { shortcode });
+        captionText = '🎵 Musiqa aniqlanmadi.';
+      } else {
+        logger.error('Music recognition failed for reel', musicErr);
+        captionText = '🎵 Musiqa aniqlanmadi.';
+      }
     }
 
-    logger.info('Telegram response sent', { jobId });
+    // 5. Send ONE video message with caption and inline keyboard
+    const videoSent = await sendReelVideoToTelegram(
+      ctx,
+      reelMedia.mediaUrl,
+      reelMedia.id || shortcode,
+      captionText,
+      keyboard,
+      downloadedBuffer
+    );
+
+    if (!videoSent) {
+      logger.error('Telegram video send failed');
+      throw new Error('Telegram video send failed');
+    }
+
+    // 6. Clean up temporary status message to leave ONLY the single Video message
+    if (statusMsg && ctx.chat?.id) {
+      await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
+    }
+
+    logger.info('Telegram single video response sent successfully', { jobId });
   } catch (error: unknown) {
     logger.error('Error handling Instagram Reel URL', error);
     const userError = formatErrorMessage(error);
@@ -257,7 +259,7 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
 }
 
 /**
- * Handles callback queries for "find_music:<jobId>" and "retry_music:<jobId>"
+ * Handles callback queries (e.g. "get_song:<jobId>")
  */
 export async function handleCallbackQuery(ctx: Context): Promise<void> {
   const callbackData = ctx.callbackQuery?.data;
@@ -272,79 +274,19 @@ export async function handleCallbackQuery(ctx: Context): Promise<void> {
     return;
   }
 
-  await ctx.answerCallbackQuery();
-
-  const messageId = ctx.callbackQuery.message?.message_id;
-  const chatId = ctx.callbackQuery.message?.chat?.id;
-
-  if (!messageId || !chatId) return;
-
-  if (callbackData.startsWith('find_music:') || callbackData.startsWith('retry_music:')) {
-    const jobId = callbackData.split(':')[1];
-
-    try {
-      await ctx.api.editMessageText(
-        chatId,
-        messageId,
-        '🔍 Musiqa aniqlanmoqda...'
-      );
-
-      const job = await getReelJob(jobId);
-
-      if (!job) {
-        await ctx.api.editMessageText(
-          chatId,
-          messageId,
-          '⚠️ So‘rov muddati o‘tgan. Iltimos, Reel linkini qayta yuboring.'
-        );
-        return;
-      }
-
-      // Use refreshAndIdentify to handle potentially expired media URLs on retry
-      const song = await refreshAndIdentify(job);
-
-      let successMessage = '🎵 *MUSIQA TOPILDI*\n\n';
-      successMessage += `🎤 *Artist:* ${escapeMarkdown(song.artist)}\n`;
-      successMessage += `🎵 *Track:* ${escapeMarkdown(song.title)}\n`;
-      if (song.album) {
-        successMessage += `💿 *Album:* ${escapeMarkdown(song.album)}\n`;
-      }
-      if (song.releaseDate) {
-        successMessage += `📅 *Released:* ${escapeMarkdown(song.releaseDate)}\n`;
-      }
-
-      const keyboard = buildSongLinksKeyboard(song);
-
-      await ctx.api.editMessageText(
-        chatId,
-        messageId,
-        successMessage,
-        {
-          parse_mode: 'Markdown',
-          reply_markup: keyboard,
-        }
-      );
-
-      logger.info('Telegram response sent', { chatId, messageId, jobId });
-    } catch (error: unknown) {
-      logger.error(`Music identification failed for job ${jobId}`, error);
-      const userErrorMsg = formatErrorMessage(error);
-
-      await ctx.api.editMessageText(
-        chatId,
-        messageId,
-        userErrorMsg,
-        {
-          reply_markup: buildRetryKeyboard(jobId),
-        }
-      ).catch(() => {
-        logger.error('Failed to edit callback message with error state');
-      });
-    }
+  if (callbackData.startsWith('get_song:')) {
+    await ctx.answerCallbackQuery({
+      text: '🎧 Qo‘shiqni yuklab olish funksiyasi tez orada ishga tushadi!',
+      show_alert: true,
+    });
+    return;
   }
+
+  await ctx.answerCallbackQuery();
 }
 
 function escapeMarkdown(text: string): string {
   return text.replace(/[_*`\[\]]/g, '\\$&');
 }
+
 

@@ -1,8 +1,9 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { Context } from 'grammy';
-import { handleTextMessage, sendReelVideoToTelegram } from '../lib/bot/handlers';
+import { formatSongCaption, handleTextMessage, sendReelVideoToTelegram } from '../lib/bot/handlers';
 import * as instagramService from '../lib/services/instagram';
 import * as musicService from '../lib/services/music-recognition';
+import { MusicNotFoundError } from '../lib/utils/errors';
 
 vi.mock('../lib/services/instagram');
 vi.mock('../lib/services/music-recognition');
@@ -12,8 +13,29 @@ describe('Telegram Bot Handlers', () => {
     vi.clearAllMocks();
   });
 
+  describe('formatSongCaption', () => {
+    it('should format song metadata into minimal caption string with track title, artist, album, and release year', () => {
+      const song = {
+        title: 'United In Grief',
+        artist: 'Kendrick Lamar',
+        album: 'Mr. Morale & The Big Steppers',
+        releaseDate: '2022-05-13',
+      };
+
+      const caption = formatSongCaption(song);
+
+      expect(caption).toBe(
+        '🎵 *United In Grief*\n' +
+        '   Kendrick Lamar\n\n' +
+        '━━━━━━━━━━━━━━━━━━\n' +
+        '💿 Mr. Morale & The Big Steppers\n' +
+        '📅 2022'
+      );
+    });
+  });
+
   describe('sendReelVideoToTelegram', () => {
-    it('should send video directly by URL when Telegram API succeeds', async () => {
+    it('should send video directly by URL with caption and inline keyboard when Telegram API succeeds', async () => {
       const mockCtx = {
         chat: { id: 12345 },
         api: {
@@ -24,13 +46,15 @@ describe('Telegram Bot Handlers', () => {
       const success = await sendReelVideoToTelegram(
         mockCtx,
         'https://cdn.socialkit.dev/video.mp4',
-        'DRU4smMj0cu'
+        'DRU4smMj0cu',
+        'Test Caption'
       );
 
       expect(success).toBe(true);
       expect(mockCtx.api.sendVideo).toHaveBeenCalledWith(
         12345,
-        'https://cdn.socialkit.dev/video.mp4'
+        'https://cdn.socialkit.dev/video.mp4',
+        expect.objectContaining({ caption: 'Test Caption', parse_mode: 'Markdown' })
       );
     });
 
@@ -51,7 +75,8 @@ describe('Telegram Bot Handlers', () => {
       const success = await sendReelVideoToTelegram(
         mockCtx,
         'https://cdn.socialkit.dev/video.mp4',
-        'DRU4smMj0cu'
+        'DRU4smMj0cu',
+        'Test Caption'
       );
 
       expect(success).toBe(true);
@@ -60,7 +85,7 @@ describe('Telegram Bot Handlers', () => {
   });
 
   describe('handleTextMessage', () => {
-    it('should process Instagram Reel URL, send video, and output music recognition result', async () => {
+    it('should process Instagram Reel URL, recognize song, and send ONE video message with caption and button', async () => {
       const mockCtx = {
         from: { id: 999 },
         message: { text: 'https://www.instagram.com/reel/DRU4smMj0cu/' },
@@ -68,7 +93,7 @@ describe('Telegram Bot Handlers', () => {
         reply: vi.fn().mockResolvedValue({ message_id: 100 }),
         api: {
           sendVideo: vi.fn().mockResolvedValue({ message_id: 101 }),
-          editMessageText: vi.fn().mockResolvedValue({ message_id: 100 }),
+          deleteMessage: vi.fn().mockResolvedValue(true),
         },
       } as unknown as Context;
 
@@ -91,20 +116,48 @@ describe('Telegram Bot Handlers', () => {
 
       await handleTextMessage(mockCtx);
 
-      expect(mockCtx.reply).toHaveBeenCalledWith(
-        '🎬 Reel qabul qilindi\n\n⏳ Video olinmoqda...'
-      );
+      expect(mockCtx.reply).toHaveBeenCalledWith('⏳ Video va musiqa yuklanmoqda...');
 
       expect(mockCtx.api.sendVideo).toHaveBeenCalledWith(
         12345,
-        'https://cdn.socialkit.dev/video.mp4'
+        'https://cdn.socialkit.dev/video.mp4',
+        expect.objectContaining({
+          caption: expect.stringContaining('United In Grief'),
+          parse_mode: 'Markdown',
+        })
       );
 
-      expect(mockCtx.api.editMessageText).toHaveBeenCalledWith(
+      expect(mockCtx.api.deleteMessage).toHaveBeenCalledWith(12345, 100);
+    });
+
+    it('should send video with fallback caption when music recognition finds no match', async () => {
+      const mockCtx = {
+        from: { id: 999 },
+        message: { text: 'https://www.instagram.com/reel/DRU4smMj0cu/' },
+        chat: { id: 12345 },
+        reply: vi.fn().mockResolvedValue({ message_id: 100 }),
+        api: {
+          sendVideo: vi.fn().mockResolvedValue({ message_id: 101 }),
+          deleteMessage: vi.fn().mockResolvedValue(true),
+        },
+      } as unknown as Context;
+
+      const mockMedia = {
+        id: 'DRU4smMj0cu',
+        mediaUrl: 'https://cdn.socialkit.dev/video.mp4',
+      };
+      vi.spyOn(instagramService, 'getInstagramReel').mockResolvedValueOnce(mockMedia);
+      vi.spyOn(musicService, 'downloadMediaBuffer').mockResolvedValueOnce(Buffer.from('video bytes'));
+      vi.spyOn(musicService, 'identifySong').mockRejectedValueOnce(new MusicNotFoundError());
+
+      await handleTextMessage(mockCtx);
+
+      expect(mockCtx.api.sendVideo).toHaveBeenCalledWith(
         12345,
-        100,
-        expect.stringContaining('Kendrick Lamar'),
-        expect.objectContaining({ parse_mode: 'Markdown' })
+        'https://cdn.socialkit.dev/video.mp4',
+        expect.objectContaining({
+          caption: '🎵 Musiqa aniqlanmadi.',
+        })
       );
     });
   });

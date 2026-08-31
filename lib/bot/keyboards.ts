@@ -2,6 +2,13 @@ import { InlineKeyboard } from 'grammy';
 import { SongResult } from '../services/music-recognition';
 
 /**
+ * Creates inline keyboard with [ 🎧 QO‘SHIQNI OLISH ] button below video
+ */
+export function buildGetSongKeyboard(jobId: string): InlineKeyboard {
+  return new InlineKeyboard().text('🎧 QO‘SHIQNI OLISH', `get_song:${jobId}`);
+}
+
+/**
  * Creates keyboard for initial reel processed state
  */
 export function buildFindMusicKeyboard(jobId: string): InlineKeyboard {
