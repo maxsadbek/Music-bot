@@ -4,6 +4,7 @@ import { validateAndNormalizeInstagramUrl } from '../validation/instagram';
 import {
   InstagramApiError,
   PrivateOrDeletedReelError,
+  ProviderQuotaExhaustedError,
 } from '../utils/errors';
 
 export interface InstagramReelMedia {
@@ -212,9 +213,25 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
 
       logger.error(`[IG] Instagram API HTTP ${status || 'unknown'}`, providerMsg);
 
-      // Only treat as private/deleted when the provider explicitly says so.
-      // Do NOT blindly convert 403/404 — those may be auth or rate-limit errors.
       const lowerMsg = (providerMsg || '').toLowerCase();
+
+      // Detect monthly quota / credit exhaustion (SocialKit returns 403 for this)
+      const isQuotaError = (
+        status === 403 || status === 429
+      ) && (
+        lowerMsg.includes('limit') ||
+        lowerMsg.includes('quota') ||
+        lowerMsg.includes('credit') ||
+        lowerMsg.includes('exceeded') ||
+        lowerMsg.includes('exhausted')
+      );
+
+      if (isQuotaError) {
+        logger.error('[IG] Provider monthly quota/request limit exhausted');
+        throw new ProviderQuotaExhaustedError('SocialKit', providerMsg || undefined);
+      }
+
+      // Only treat as private/deleted when the provider explicitly says so.
       if (
         lowerMsg.includes('private') ||
         lowerMsg.includes('deleted') ||

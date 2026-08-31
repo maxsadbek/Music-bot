@@ -39,6 +39,16 @@ export class InstagramApiError extends AppError {
   }
 }
 
+export class ProviderQuotaExhaustedError extends AppError {
+  constructor(providerName: string, details?: string) {
+    super(
+      `${providerName} quota exhausted: ${details || 'monthly request limit exceeded'}`,
+      '⚠️ Instagram video yuklash xizmatining oylik limiti tugagan.\nKeyinroq qayta urinib ko\'ring.'
+    );
+    this.name = 'ProviderQuotaExhaustedError';
+  }
+}
+
 export class MusicNotFoundError extends AppError {
   constructor() {
     super(

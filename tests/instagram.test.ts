@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import axios from 'axios';
 import { getInstagramReel } from '../lib/services/instagram';
-import { InstagramApiError, PrivateOrDeletedReelError } from '../lib/utils/errors';
+import { InstagramApiError, PrivateOrDeletedReelError, ProviderQuotaExhaustedError } from '../lib/utils/errors';
 
 vi.mock('axios');
 const mockedAxios = axios as any;
@@ -14,6 +14,10 @@ describe('SocialKit Instagram Service', () => {
     process.env.INSTAGRAM_API_URL = 'https://api.socialkit.dev/instagram/download';
     process.env.INSTAGRAM_API_KEY = 'test_socialkit_key';
     vi.clearAllMocks();
+
+    // Make axios.isAxiosError recognize plain objects with a `response` property
+    mockedAxios.isAxiosError = (obj: any) =>
+      obj != null && typeof obj === 'object' && 'response' in obj;
   });
 
   afterEach(() => {
@@ -495,7 +499,55 @@ describe('SocialKit Instagram Service', () => {
     ).rejects.toThrow(InstagramApiError);
   });
 
-  // Test 10: HTTP error from SocialKit
+  // Test 10a: monthly quota exhaustion (SocialKit 403)
+  it('should throw ProviderQuotaExhaustedError for 403 limit/quota exceeded', async () => {
+    mockedAxios.post.mockRejectedValueOnce({
+      response: {
+        status: 403,
+        data: {
+          message: 'Request limit exceeded for this month',
+        },
+      },
+    });
+
+    await expect(
+      getInstagramReel('https://www.instagram.com/reel/QUOTA123/')
+    ).rejects.toThrow(ProviderQuotaExhaustedError);
+  });
+
+  // Test 10b: 429 rate limit
+  it('should throw ProviderQuotaExhaustedError for 429 rate limit exceeded', async () => {
+    mockedAxios.post.mockRejectedValueOnce({
+      response: {
+        status: 429,
+        data: {
+          message: 'Too many requests - credit limit reached',
+        },
+      },
+    });
+
+    await expect(
+      getInstagramReel('https://www.instagram.com/reel/RATELIMIT/')
+    ).rejects.toThrow(ProviderQuotaExhaustedError);
+  });
+
+  // Test 10c: 403 without quota keywords should NOT be quota error
+  it('should throw InstagramApiError (not quota) for 403 without quota keywords', async () => {
+    mockedAxios.post.mockRejectedValueOnce({
+      response: {
+        status: 403,
+        data: {
+          message: 'Forbidden: invalid access key',
+        },
+      },
+    });
+
+    await expect(
+      getInstagramReel('https://www.instagram.com/reel/FORBIDDEN/')
+    ).rejects.toThrow(InstagramApiError);
+  });
+
+  // Test 10d: HTTP error from SocialKit
   it('should throw InstagramApiError for HTTP error from SocialKit', async () => {
     mockedAxios.post.mockRejectedValueOnce({
       response: {
