@@ -43,14 +43,13 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
       headers['Authorization'] = `Bearer ${apiKey}`;
     }
 
-    // Call configured Instagram extraction service with timeout
     const response = await axios.get(apiUrl, {
       params: {
         url: normalizedUrl,
         shortcode,
       },
       headers,
-      timeout: 12000, // 12 seconds timeout
+      timeout: 12000,
     });
 
     const data = response.data;
@@ -60,7 +59,6 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
     }
 
     // Flexible extraction mapping to support standard RapidAPI & generic media APIs
-    // Search for video/media URL in common response shapes:
     const videoUrl =
       data.video_url ||
       data.media_url ||
@@ -87,6 +85,11 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
       (data.result && (data.result.title || data.result.caption));
 
     if (!videoUrl) {
+      // If videoUrl extraction fails and DEBUG_INSTAGRAM_API=true, log sanitized raw data
+      if (process.env.DEBUG_INSTAGRAM_API === 'true') {
+        logger.error('Failed to extract videoUrl from Instagram API response. Raw response:', JSON.stringify(data));
+      }
+
       if (
         data.status === 404 ||
         data.error?.includes('private') ||

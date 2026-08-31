@@ -11,7 +11,8 @@ Musify is a production-ready Telegram Bot designed to identify music from Instag
 - **Song Recognition**: Integrated with **AudD API** for track identification, returning artist, track, album, release date, and direct streaming links (Spotify, Apple Music).
 - **Clean Telegram UX**: Interactive inline callback buttons, dynamic message updates (avoiding chat spam), custom status emojis (🎬 ⏳ ✅ 🔍 🎵 🎤 💿 😔 ❌).
 - **Vercel Serverless Compatible**: Fully stateless webhooks designed to scale on Vercel without requiring a permanent VPS or local FFmpeg daemon.
-- **Redis Caching Support**: Optional Upstash / Redis job caching with in-memory fallback for local development.
+- **Redis Caching Support**: Upstash Redis primary job storage with in-memory cache for speed optimizations.
+- **Rate Limiting**: Integrated sliding-window rate limiter per user (max 5 requests per minute).
 
 ---
 
@@ -22,6 +23,7 @@ Musify is a production-ready Telegram Bot designed to identify music from Instag
 - **Telegram Bot Engine**: grammY
 - **Validation**: Zod
 - **Music Recognition API**: AudD API
+- **Testing**: Vitest
 - **Deployment**: Vercel
 
 ---
@@ -37,8 +39,19 @@ Create a `.env.local` file in your root directory based on `.env.example`:
 | `AUDD_API_TOKEN` | API token from [AudD Music Recognition](https://audd.io/) | **Yes** |
 | `INSTAGRAM_API_URL` | HTTP endpoint URL for Instagram Reel downloader service | **Yes** |
 | `INSTAGRAM_API_KEY` | API Key for Instagram downloader service (e.g., RapidAPI) | Optional / Service dependent |
-| `UPSTASH_REDIS_REST_URL` | Upstash Redis REST URL for distributed jobs | Optional |
-| `UPSTASH_REDIS_REST_TOKEN` | Upstash Redis REST Token | Optional |
+| `UPSTASH_REDIS_REST_URL` | Upstash Redis REST URL for distributed jobs | Recommended |
+| `UPSTASH_REDIS_REST_TOKEN` | Upstash Redis REST Token | Recommended |
+| `DEBUG_INSTAGRAM_API` | Set to `true` to log raw API data when video URL extraction fails | Optional |
+
+---
+
+## ⚠️ Important Note on Vercel Plan Limits
+
+> [!IMPORTANT]
+> The webhook API route is configured with `export const maxDuration = 60;` to allow sufficient time for Instagram media retrieval (up to 12s) and AudD music recognition (up to 20s).
+>
+> - **Vercel Hobby (Free)** plan caps serverless function execution at 10–15 seconds. If requests exceed 10s on Hobby, Vercel will time out the function.
+> - **Vercel Pro** is recommended for production deployments to support `maxDuration` up to 60 seconds.
 
 ---
 
@@ -59,30 +72,35 @@ Create a `.env.local` file in your root directory based on `.env.example`:
 
 ---
 
-## 💻 Local Development
+## 💻 Local Development & Unit Tests
 
 1. **Install dependencies**:
    ```bash
    npm install
    ```
 
-2. **Set up `.env.local`**:
+2. **Run Unit Tests**:
+   ```bash
+   npm run test
+   ```
+
+3. **Set up `.env.local`**:
    ```bash
    cp .env.example .env.local
    # Fill in TELEGRAM_BOT_TOKEN, AUDD_API_TOKEN, INSTAGRAM_API_URL, INSTAGRAM_API_KEY
    ```
 
-3. **Start Next.js dev server**:
+4. **Start Next.js dev server**:
    ```bash
    npm run dev
    ```
 
-4. **Expose local server (e.g. via ngrok)**:
+5. **Expose local server (e.g. via ngrok)**:
    ```bash
    ngrok http 3000
    ```
 
-5. **Set Webhook to local ngrok tunnel**:
+6. **Set Webhook to local ngrok tunnel**:
    ```bash
    curl -X POST "https://api.telegram.org/bot<YOUR_TELEGRAM_BOT_TOKEN>/setWebhook" \
      -H "Content-Type: application/json" \
@@ -95,13 +113,7 @@ Create a `.env.local` file in your root directory based on `.env.example`:
 
 1. Push your repository to GitHub / GitLab / Bitbucket.
 2. Import project into [Vercel](https://vercel.com).
-3. Add Environment Variables in Vercel project settings:
-   - `TELEGRAM_BOT_TOKEN`
-   - `TELEGRAM_WEBHOOK_SECRET` (optional)
-   - `AUDD_API_TOKEN`
-   - `INSTAGRAM_API_URL`
-   - `INSTAGRAM_API_KEY`
-   - `UPSTASH_REDIS_REST_URL` & `UPSTASH_REDIS_REST_TOKEN` (optional)
+3. Add Environment Variables in Vercel project settings.
 4. Click **Deploy**.
 5. Once deployed, set your Telegram Webhook URL to your production Vercel domain:
    ```bash
@@ -112,32 +124,3 @@ Create a `.env.local` file in your root directory based on `.env.example`:
        "secret_token": "<YOUR_TELEGRAM_WEBHOOK_SECRET>"
      }'
    ```
-
----
-
-## 🤖 Bot Commands & User Flow
-
-- `/start`: Displays welcome banner and instructions.
-- `/help`: Displays step-by-step usage guide.
-- `/about`: Displays bot information.
-
-### User Journey:
-1. User sends an Instagram Reel link (`https://www.instagram.com/reel/XXXXX/`).
-2. Bot validates link and responds with `🎬 Reel received \n\n ⏳ Getting the video...`.
-3. Upon video retrieval, bot updates message to `✅ Video found!` with inline button `[ 🎵 Musiqani topish ]`.
-4. User clicks `[ 🎵 Musiqani topish ]`.
-5. Bot updates message to `🔍 Musiqa aniqlanmoqda...` and queries AudD API.
-6. Song identified -> Bot displays track details (`🎤 Artist`, `🎵 Track`, `💿 Album`) and streaming buttons (`[ 🎧 Spotify ]`, `[ 🍎 Apple Music ]`).
-7. Song not identified -> Bot displays helpful reasons and `[ 🔄 Qayta urinib ko‘rish ]` button.
-
----
-
-## 📜 Code Quality & Verification
-
-Run strict TypeScript checks and ESLint build validation:
-
-```bash
-npm run type-check
-npm run lint
-npm run build
-```

@@ -5,8 +5,9 @@ import {
   validateAndNormalizeInstagramUrl,
 } from '../validation/instagram';
 import { getInstagramReel } from '../services/instagram';
-import { identifySong } from '../services/music-recognition';
-import { generateJobId, getReelJob, saveReelJob } from '../services/cache';
+import { identifySong, SongResult } from '../services/music-recognition';
+import { generateJobId, getReelJob, ReelJobData, saveReelJob } from '../services/cache';
+import { checkRateLimit } from '../services/rate-limit';
 import {
   buildFindMusicKeyboard,
   buildRetryKeyboard,
@@ -14,8 +15,31 @@ import {
 } from './keyboards';
 import {
   formatErrorMessage,
-  InvalidInstagramUrlError,
+  MusicNotFoundError,
+  RateLimitError,
 } from '../utils/errors';
+
+/**
+ * Re-fetches fresh Instagram media URL if initial recognition fails due to expired CDN link,
+ * then retries AudD music recognition.
+ */
+export async function refreshAndIdentify(job: ReelJobData): Promise<SongResult> {
+  try {
+    return await identifySong(job.mediaUrl);
+  } catch (error) {
+    if (error instanceof MusicNotFoundError) {
+      throw error;
+    }
+    logger.warn(`Initial recognition failed for job ${job.jobId}. Re-fetching media URL from Instagram...`);
+    const freshMedia = await getInstagramReel(job.reelUrl);
+    const updatedJob: ReelJobData = {
+      ...job,
+      mediaUrl: freshMedia.mediaUrl,
+    };
+    await saveReelJob(updatedJob);
+    return await identifySong(freshMedia.mediaUrl);
+  }
+}
 
 /**
  * /start command handler
@@ -57,13 +81,18 @@ export async function handleAbout(ctx: Context): Promise<void> {
  * Processes incoming text message containing an Instagram Reel URL
  */
 export async function handleTextMessage(ctx: Context): Promise<void> {
+  const userId = ctx.from?.id;
+  if (userId && !(await checkRateLimit(userId))) {
+    await ctx.reply(formatErrorMessage(new RateLimitError()));
+    return;
+  }
+
   const text = ctx.message?.text;
   if (!text) return;
 
   const urlInText = extractInstagramUrlFromText(text);
 
   if (!urlInText) {
-    // Reply with invalid URL message if user sends arbitrary non-link text
     await ctx.reply('❌ Bu Instagram Reel linki emas.');
     return;
   }
@@ -72,10 +101,8 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
   try {
     const { normalizedUrl, shortcode } = validateAndNormalizeInstagramUrl(urlInText);
 
-    // Send initial clean status message
     statusMsg = await ctx.reply('🎬 Reel received\n\n⏳ Getting the video...');
 
-    // Fetch media video download URL from Instagram abstraction service
     const reelMedia = await getInstagramReel(normalizedUrl);
 
     const jobId = generateJobId();
@@ -87,7 +114,6 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       createdAt: Date.now(),
     });
 
-    // Update existing message to success state with action keyboard
     await ctx.api.editMessageText(
       ctx.chat!.id,
       statusMsg.message_id,
@@ -121,7 +147,15 @@ export async function handleCallbackQuery(ctx: Context): Promise<void> {
   const callbackData = ctx.callbackQuery?.data;
   if (!callbackData) return;
 
-  // Immediately acknowledge callback query
+  const userId = ctx.from?.id;
+  if (userId && !(await checkRateLimit(userId))) {
+    await ctx.answerCallbackQuery({
+      text: '⏳ Juda ko‘p so‘rov yuborildi. Biroz kutib, qayta urinib ko‘ring.',
+      show_alert: true,
+    });
+    return;
+  }
+
   await ctx.answerCallbackQuery();
 
   const messageId = ctx.callbackQuery.message?.message_id;
@@ -133,7 +167,6 @@ export async function handleCallbackQuery(ctx: Context): Promise<void> {
     const jobId = callbackData.split(':')[1];
 
     try {
-      // Update status to processing
       await ctx.api.editMessageText(
         chatId,
         messageId,
@@ -151,10 +184,9 @@ export async function handleCallbackQuery(ctx: Context): Promise<void> {
         return;
       }
 
-      // Call song recognition service
-      const song = await identifySong(job.mediaUrl);
+      // Use refreshAndIdentify to handle potentially expired media URLs on retry
+      const song = await refreshAndIdentify(job);
 
-      // Build clean output message
       let successMessage = '🎵 *MUSIQА TOPILDI*\n\n';
       successMessage += `🎤 *Artist:* ${escapeMarkdown(song.artist)}\n`;
       successMessage += `🎵 *Track:* ${escapeMarkdown(song.title)}\n`;
@@ -194,9 +226,6 @@ export async function handleCallbackQuery(ctx: Context): Promise<void> {
   }
 }
 
-/**
- * Utility to escape Telegram Markdown special characters in dynamic text
- */
 function escapeMarkdown(text: string): string {
   return text.replace(/[_*`\[\]]/g, '\\$&');
 }

@@ -4,6 +4,14 @@ import { logger } from '../../../../lib/utils/logger';
 
 export const dynamic = 'force-dynamic';
 
+/**
+ * Configure maximum execution duration for Vercel Serverless Functions.
+ * Necessary because Instagram media retrieval (up to 12s timeout) and AudD
+ * music recognition API (up to 20s timeout) can take upwards of 30+ seconds.
+ * Note: Setting maxDuration > 10s requires Vercel Pro plan.
+ */
+export const maxDuration = 60;
+
 export async function POST(req: Request): Promise<Response> {
   try {
     // 1. Validate Secret Token if TELEGRAM_WEBHOOK_SECRET environment variable is set

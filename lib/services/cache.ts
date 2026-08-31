@@ -30,79 +30,78 @@ class MemoryStore {
 }
 
 const memoryCache = new MemoryStore();
+let warnedMissingRedis = false;
 
-/**
- * Initializes Redis client if environment variables are provided
- */
-function getRedisClient(): Redis | null {
-  if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+export function getRedisClient(): Redis | null {
+  const url = process.env.UPSTASH_REDIS_REST_URL || process.env.REDIS_URL;
+  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+  if (url && token) {
     try {
-      return new Redis({
-        url: process.env.UPSTASH_REDIS_REST_URL,
-        token: process.env.UPSTASH_REDIS_REST_TOKEN,
-      });
+      return new Redis({ url, token });
     } catch (e) {
-      logger.error('Failed to initialize Upstash Redis REST client', e);
+      logger.error('Failed to instantiate Upstash Redis client', e);
     }
+  }
+
+  if (!warnedMissingRedis) {
+    logger.warn('Redis sozlanmagan — production\'da ishonchli ishlash uchun Upstash Redis talab qilinadi.');
+    warnedMissingRedis = true;
   }
   return null;
 }
 
 const redisClient = getRedisClient();
 
-/**
- * Generates a safe, short job ID (e.g. 12-char hex).
- */
 export function generateJobId(): string {
   return crypto.randomBytes(6).toString('hex');
 }
 
 /**
- * Saves a Reel processing job into cache (Redis or Memory).
+ * Saves a Reel processing job.
+ * Uses Redis as primary storage when available, with memory store for fast local lookups.
  */
 export async function saveReelJob(jobData: ReelJobData): Promise<string> {
   const ttl = 3600; // 1 hour TTL
   const key = `musify:job:${jobData.jobId}`;
 
-  // Always save to memory cache for fast local access
-  memoryCache.set(key, jobData, ttl);
+  const redis = getRedisClient() || redisClient;
 
-  if (redisClient) {
+  if (redis) {
     try {
-      await redisClient.set(key, JSON.stringify(jobData), { ex: ttl });
+      await redis.set(key, JSON.stringify(jobData), { ex: ttl });
     } catch (err) {
-      logger.error('Error writing job to Upstash Redis', err);
+      logger.error('Redis save error, falling back to memory store', err);
     }
   }
+
+  // Memory store cache update
+  memoryCache.set(key, jobData, ttl);
 
   return jobData.jobId;
 }
 
 /**
- * Retrieves a Reel processing job from cache.
+ * Retrieves a Reel processing job.
+ * Redis is primary data source when available.
  */
 export async function getReelJob(jobId: string): Promise<ReelJobData | null> {
   const key = `musify:job:${jobId}`;
+  const redis = getRedisClient() || redisClient;
 
-  // 1. Try memory cache first
-  const memoryResult = memoryCache.get(key);
-  if (memoryResult) {
-    return memoryResult;
-  }
-
-  // 2. Try Redis if available
-  if (redisClient) {
+  if (redis) {
     try {
-      const dataStr = await redisClient.get<string | object>(key);
+      const dataStr = await redis.get<string | object>(key);
       if (dataStr) {
         const parsed = typeof dataStr === 'string' ? JSON.parse(dataStr) : (dataStr as ReelJobData);
         memoryCache.set(key, parsed, 3600); // Backfill memory cache
         return parsed;
       }
     } catch (err) {
-      logger.error('Error fetching job from Upstash Redis', err);
+      logger.error('Redis read error, checking memory cache fallback', err);
     }
   }
 
-  return null;
+  // Memory cache fallback
+  return memoryCache.get(key);
 }
