@@ -6,6 +6,7 @@ export interface ReelJobData {
   jobId: string;
   reelUrl: string;
   mediaUrl: string;
+  videoFilePath?: string;
   shortcode: string;
   createdAt: number;
   songTitle?: string;

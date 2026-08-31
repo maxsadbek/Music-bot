@@ -4,7 +4,7 @@ import {
   extractInstagramUrlFromText,
   validateAndNormalizeInstagramUrl,
 } from '../validation/instagram';
-import { getInstagramReel } from '../services/instagram';
+import { getInstagramReel, cleanupTempFile } from '../services/instagram';
 import { downloadMediaBuffer, identifySong, SongResult } from '../services/music-recognition';
 import { getSongAudio, AudioSourceError } from '../services/audio-source';
 import {
@@ -22,6 +22,10 @@ import {
   MusicNotFoundError,
   RateLimitError,
 } from '../utils/errors';
+import { execFile } from 'child_process';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 
 const MONTHS: Record<string, string> = {
   '01': 'January', '02': 'February', '03': 'March',
@@ -84,8 +88,8 @@ export function formatSongCaption(song: SongResult): string {
 
   if (album || date) {
     caption += '\\n';
-    if (album) caption += `\\n💿 ${album}`;
-    if (date) caption += `\\n📅 ${date}`;
+    if (album) caption += `\\\\n💿 ${album}`;
+    if (date) caption += `\\\\n📅 ${date}`;
   }
 
   return caption;
@@ -151,6 +155,100 @@ export async function sendReelVideoToTelegram(
 }
 
 /**
+ * Safely edits a status message, ignoring errors (e.g. text unchanged, message deleted).
+ */
+async function editStatus(
+  ctx: Context,
+  statusMsg: { message_id: number } | undefined,
+  text: string
+): Promise<void> {
+  if (statusMsg && ctx.chat?.id) {
+    try {
+      await ctx.api.editMessageText(ctx.chat.id, statusMsg.message_id, text);
+    } catch {
+      // Message edit may fail if text is the same or message was deleted — safe to ignore
+    }
+  }
+}
+
+/**
+ * Extracts audio from a video file using ffmpeg and sends it as a Telegram audio message.
+ * Returns true if successful.
+ */
+async function extractAndSendAudio(
+  ctx: Context,
+  videoFilePath: string,
+  title: string,
+  artist: string,
+  durationSeconds?: number
+): Promise<boolean> {
+  const chatId = ctx.chat?.id;
+  if (!chatId) return false;
+
+  const tempDir = path.join(os.tmpdir(), 'musify-audio');
+  if (!fs.existsSync(tempDir)) {
+    fs.mkdirSync(tempDir, { recursive: true });
+  }
+
+  const audioPath = path.join(
+    tempDir,
+    `${title.replace(/[^a-zA-Z0-9]/g, '_')}_${Date.now()}.mp3`
+  );
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      execFile(
+        'ffmpeg',
+        [
+          '-i', videoFilePath,
+          '-vn',
+          '-acodec', 'libmp3lame',
+          '-q:a', '2',
+          '-y',
+          audioPath,
+        ],
+        { timeout: 30_000 },
+        (error) => {
+          if (error) reject(error);
+          else resolve();
+        }
+      );
+    });
+
+    const audioBuffer = fs.readFileSync(audioPath);
+    if (!audioBuffer || audioBuffer.length === 0) {
+      throw new Error('Extracted audio file is empty');
+    }
+
+    await ctx.api.sendAudio(
+      chatId,
+      new InputFile(audioBuffer, `${title}.mp3`),
+      {
+        title,
+        performer: artist,
+        duration: durationSeconds,
+      }
+    );
+
+    logger.info('Audio extracted via ffmpeg and sent to Telegram', {
+      title,
+      artist,
+      size: audioBuffer.length,
+    });
+    return true;
+  } catch (err) {
+    logger.warn('ffmpeg audio extraction failed, will fall back to search', err);
+    return false;
+  } finally {
+    try {
+      if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+    } catch {
+      // ignore cleanup errors
+    }
+  }
+}
+
+/**
  * Re-fetches fresh Instagram media URL if initial recognition fails due to expired CDN link,
  * then retries ACRCloud music recognition.
  */
@@ -210,52 +308,48 @@ export async function handleAbout(ctx: Context): Promise<void> {
 /**
  * Processes incoming text message containing an Instagram Reel URL.
  *
- * Flow:
+ * Single status message flow (edited at each step via editMessageText):
  * 1. 🎬 Reel qabul qilindi / ⏳ Video olinmoqda...
- * 2. Fetch Instagram reel via SocialKit
- * 3. Pre-download buffer once (reuse for Telegram + ACRCloud)
- * 4. ACRCloud music recognition
- * 5. Send video with caption + inline button
+ * 2. ⏳ Video tayyorlanmoqda... (downloading from Render)
+ * 3. 🔍 Musiqa aniqlanmoqda... (ACRCloud)
+ * 4. 🎵 MUSIQA TOPILDI (or deleted if no music)
+ * 5. Video sent with caption + button (ONE message)
+ * 6. Status message deleted
+ *
+ * Correct order per user request:
+ * Reel URL → downloader → video Buffer → Telegram video → ACRCloud → music result
  */
 export async function handleTextMessage(ctx: Context): Promise<void> {
-  logger.info('[IG DEBUG] handleTextMessage called');
-  
   const userId = ctx.from?.id;
   if (userId && !(await checkRateLimit(userId))) {
-    logger.info('[IG DEBUG] Rate limit exceeded for user:', userId);
     await ctx.reply(formatErrorMessage(new RateLimitError()));
     return;
   }
 
   const text = ctx.message?.text;
-  if (!text) {
-    logger.info('[IG DEBUG] No text in message');
-    return;
-  }
-  
-  logger.info('[IG DEBUG] Message text received, length:', text.length);
+  if (!text) return;
 
   const urlInText = extractInstagramUrlFromText(text);
-  logger.info('[IG DEBUG] URL extraction result:', urlInText || 'none');
 
   if (!urlInText) {
-    logger.info('[IG DEBUG] No Instagram URL found in text');
     await ctx.reply('❌ Bu Instagram Reel linki emas.');
     return;
   }
 
-  let statusMsg;
+  let statusMsg: { message_id: number } | undefined;
+  let videoFilePath: string | undefined;
+
   try {
-    logger.info('[IG DEBUG] Calling validateAndNormalizeInstagramUrl');
     const { normalizedUrl, shortcode } = validateAndNormalizeInstagramUrl(urlInText);
-    logger.info('[IG DEBUG] Validation successful, shortcode:', shortcode);
     const overallStart = Date.now();
 
     // Duplicate request protection: check if we recently processed this shortcode
-    logger.info('[IG DEBUG] Checking cache for shortcode:', shortcode);
     const existingJob = await getCachedJobByShortcode(shortcode);
     if (existingJob && existingJob.songTitle && existingJob.songArtist) {
-      logger.info('Reusing existing recognition for shortcode', { shortcode, jobId: existingJob.jobId });
+      logger.info('Reusing existing recognition for shortcode', {
+        shortcode,
+        jobId: existingJob.jobId,
+      });
 
       const captionText = formatSongCaption({
         title: existingJob.songTitle,
@@ -279,40 +373,52 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       });
       return;
     }
-    logger.info('[IG DEBUG] No cached job found, proceeding with fresh request');
 
     // Send initial status message
-    statusMsg = await ctx.reply('🎬 Reel qabul qilindi\n⏳ Video olinmoqda...');
-    logger.info('[IG DEBUG] Status message sent');
+    statusMsg = (await ctx.reply(
+      '🎬 Reel qabul qilindi\n⏳ Video olinmoqda...'
+    )) as { message_id: number };
 
-    // 1. Fetch direct video media URL from SocialKit
-    logger.info('[IG DEBUG] Calling getInstagramReel with normalized URL:', normalizedUrl);
+    // Step 1: Fetch video via self-hosted Render downloader
+    // This handles: POST /api/info → POST /api/jobs → poll → download to temp file
+    await editStatus(ctx, statusMsg, '🎬 Reel qabul qilindi\n⏳ Video tayyorlanmoqda...');
     const instagramStart = Date.now();
     const reelMedia = await getInstagramReel(normalizedUrl);
-    logger.info('[IG DEBUG] getInstagramReel succeeded');
-    logger.info('[PERF] Instagram', { duration: `${Date.now() - instagramStart}ms` });
+    videoFilePath = reelMedia.videoFilePath;
+    logger.info('[PERF] Instagram downloader', {
+      duration: `${Date.now() - instagramStart}ms`,
+    });
 
-    // 2. Pre-download media buffer once to reuse for both Telegram upload fallback and ACRCloud recognition
+    // Step 2: Pre-download video buffer (for Telegram upload fallback + ACRCloud)
     const downloadStart = Date.now();
     let downloadedBuffer: Buffer | undefined;
     try {
-      downloadedBuffer = await downloadMediaBuffer(reelMedia.mediaUrl);
-      logger.info('[PERF] Video download', {
+      if (videoFilePath && fs.existsSync(videoFilePath)) {
+        downloadedBuffer = fs.readFileSync(videoFilePath);
+      } else {
+        downloadedBuffer = await downloadMediaBuffer(reelMedia.mediaUrl);
+      }
+      logger.info('[PERF] Video buffer', {
         duration: `${Date.now() - downloadStart}ms`,
-        size: downloadedBuffer.length,
+        size: downloadedBuffer?.length,
       });
     } catch (downloadErr) {
       logger.warn('Pre-downloading media buffer failed, falling back to URL', downloadErr);
     }
 
-    // 3. ACRCloud music recognition (uses pre-downloaded buffer when available)
+    // Step 3: ACRCloud music recognition (on downloaded buffer, BEFORE sending video to user)
+    await editStatus(ctx, statusMsg, '🔍 Musiqa aniqlanmoqda...');
     const recognitionStart = Date.now();
     let songResult: SongResult | undefined;
     try {
       songResult = await identifySong(downloadedBuffer || reelMedia.mediaUrl);
-      logger.info('[PERF] ACRCloud', { duration: `${Date.now() - recognitionStart}ms` });
+      logger.info('[PERF] ACRCloud', {
+        duration: `${Date.now() - recognitionStart}ms`,
+      });
     } catch (musicErr) {
-      logger.info('[PERF] ACRCloud failed', { duration: `${Date.now() - recognitionStart}ms` });
+      logger.info('[PERF] ACRCloud failed', {
+        duration: `${Date.now() - recognitionStart}ms`,
+      });
       if (musicErr instanceof MusicNotFoundError) {
         logger.info('No music recognized for reel', { shortcode });
       } else {
@@ -320,7 +426,7 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       }
     }
 
-    // 4. Build caption and keyboard
+    // Step 4: Build caption and keyboard
     let captionText = '🎵 Musiqa aniqlanmadi.';
     let keyboard: InlineKeyboard | undefined;
     const jobId = generateJobId();
@@ -330,11 +436,12 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       keyboard = buildGetSongKeyboard(jobId);
     }
 
-    // 5. Save job to cache with full metadata (will be used by the download button callback)
+    // Step 5: Save job to cache
     const jobData: ReelJobData = {
       jobId,
       reelUrl: normalizedUrl,
       mediaUrl: reelMedia.mediaUrl,
+      videoFilePath: reelMedia.videoFilePath,
       shortcode: reelMedia.id || shortcode,
       createdAt: Date.now(),
       userId,
@@ -346,11 +453,16 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
     };
 
     await saveReelJob(jobData);
-
-    // Cache by shortcode for duplicate detection
     await cacheJobByShortcode(shortcode, jobId);
 
-    // 6. Send ONE video message with caption and inline keyboard
+    // Step 6: Delete status message, then send video with final caption + button
+    if (statusMsg && ctx.chat?.id) {
+      await ctx.api
+        .deleteMessage(ctx.chat.id, statusMsg.message_id)
+        .catch(() => {});
+      statusMsg = undefined; // prevent double-delete in finally
+    }
+
     const videoStart = Date.now();
     const videoSent = await sendReelVideoToTelegram(
       ctx,
@@ -360,48 +472,42 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       keyboard,
       downloadedBuffer
     );
-    logger.info('[PERF] Telegram video', { duration: `${Date.now() - videoStart}ms` });
+    logger.info('[PERF] Telegram video', {
+      duration: `${Date.now() - videoStart}ms`,
+    });
 
     if (!videoSent) {
-      logger.error('Telegram video send failed');
       throw new Error('Telegram video send failed');
     }
 
-    // 7. Clean up temporary status message to leave ONLY the single Video message
-    if (statusMsg && ctx.chat?.id) {
-      await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {});
-    }
-
-    logger.info('[PERF] Total request', { duration: `${Date.now() - overallStart}ms`, jobId });
+    logger.info('[PERF] Total request', {
+      duration: `${Date.now() - overallStart}ms`,
+      jobId,
+    });
   } catch (error: unknown) {
-    logger.error('[IG DEBUG] ERROR in handleTextMessage');
-    logger.error('[IG DEBUG] ERROR name:', error instanceof Error ? error.constructor.name : 'Unknown');
-    logger.error('[IG DEBUG] ERROR message:', error instanceof Error ? error.message : String(error));
     logger.error('Error handling Instagram Reel URL', error);
     const userError = formatErrorMessage(error);
-    logger.info('[IG DEBUG] User error message:', userError);
 
     if (statusMsg) {
-      logger.info('[IG DEBUG] Editing status message with error');
-      await ctx.api.editMessageText(
-        ctx.chat!.id,
-        statusMsg.message_id,
-        userError
-      ).catch(() => {
-        logger.info('[IG DEBUG] Status message edit failed, sending new message');
-        ctx.reply(userError);
-      });
+      await ctx.api
+        .editMessageText(ctx.chat!.id, statusMsg.message_id, userError)
+        .catch(() => {
+          ctx.reply(userError);
+        });
     } else {
-      logger.info('[IG DEBUG] No status message, sending new error message');
       await ctx.reply(userError);
     }
+  } finally {
+    // Clean up temp video file
+    cleanupTempFile(videoFilePath);
   }
 }
 
 /**
  * Handles callback queries.
  *
- * "get_song:<jobId>" — Fetches the actual audio file and sends it to the user as a Telegram audio message.
+ * "get_song:<jobId>" — Extracts audio from cached video file via ffmpeg and sends it as Telegram audio.
+ * Falls back to audio-source search if ffmpeg extraction fails.
  */
 export async function handleCallbackQuery(ctx: Context): Promise<void> {
   const callbackData = ctx.callbackQuery?.data;
@@ -427,7 +533,10 @@ export async function handleCallbackQuery(ctx: Context): Promise<void> {
       const job = await getReelJob(jobId);
 
       if (!job || !job.songTitle || !job.songArtist) {
-        await ctx.api.sendMessage(chatId, '⚠️ Qo\'shiq maʼlumotlari topilmadi. Reel linkini qayta yuboring.');
+        await ctx.api.sendMessage(
+          chatId,
+          '⚠️ Qo\'shiq maʼlumotlari topilmadi. Reel linkini qayta yuboring.'
+        );
         return;
       }
 
@@ -444,23 +553,46 @@ export async function handleCallbackQuery(ctx: Context): Promise<void> {
 
       await ctx.api.sendMessage(chatId, '⏳ Qo\'shiq yuklanmoqda...');
 
-      const downloadStart = Date.now();
-      const audio = await getSongAudio(job.songTitle, job.songArtist);
-      logger.info('[PERF] Music download', { duration: `${Date.now() - downloadStart}ms` });
+      // Try ffmpeg extraction from cached video file first
+      let sent = false;
+      if (job.videoFilePath && fs.existsSync(job.videoFilePath)) {
+        sent = await extractAndSendAudio(
+          ctx,
+          job.videoFilePath,
+          job.songTitle,
+          job.songArtist
+        );
+      }
 
-      const uploadStart = Date.now();
-      await ctx.api.sendAudio(chatId, new InputFile(audio.buffer, `${audio.title}.mp3`), {
-        title: audio.title,
-        performer: audio.artist,
-        duration: audio.durationSeconds,
+      // Fallback: search and download audio from external source
+      if (!sent) {
+        const downloadStart = Date.now();
+        const audio = await getSongAudio(job.songTitle, job.songArtist);
+        logger.info('[PERF] Music download fallback', {
+          duration: `${Date.now() - downloadStart}ms`,
+        });
+
+        await ctx.api.sendAudio(
+          chatId,
+          new InputFile(audio.buffer, `${audio.title}.mp3`),
+          {
+            title: audio.title,
+            performer: audio.artist,
+            duration: audio.durationSeconds,
+          }
+        );
+      }
+
+      logger.info('Audio file sent to Telegram', {
+        jobId,
+        title: job.songTitle,
+        artist: job.songArtist,
       });
-      logger.info('[PERF] Telegram audio upload', { duration: `${Date.now() - uploadStart}ms` });
-
-      logger.info('Audio file sent to Telegram', { jobId, title: audio.title, artist: audio.artist });
     } catch (error: unknown) {
       logger.error('Failed to send audio for get_song callback', error);
 
-      let userMsg = '⚠️ Qo\'shiqni yuklab bo\'lmadi. Keyinroq qayta urinib ko\'ring.';
+      let userMsg =
+        '⚠️ Qo\'shiqni yuklab bo\'lmadi. Keyinroq qayta urinib ko\'ring.';
       if (error instanceof AudioSourceError) {
         userMsg = '⚠️ Qo\'shiq topilmadi. Keyinroq qayta urinib ko\'ring.';
       }

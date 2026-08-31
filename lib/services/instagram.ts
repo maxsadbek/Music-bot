@@ -4,16 +4,45 @@ import { validateAndNormalizeInstagramUrl } from '../validation/instagram';
 import {
   InstagramApiError,
   PrivateOrDeletedReelError,
-  ProviderQuotaExhaustedError,
 } from '../utils/errors';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 
 export interface InstagramReelMedia {
   id: string;
   mediaUrl: string;
-  audioUrl?: string;
+  videoFilePath?: string;
   title?: string;
   thumbnailUrl?: string;
   duration?: number;
+}
+
+const RENDER_DOWNLOADER_URL =
+  process.env.RENDER_DOWNLOADER_URL || 'https://musify-downloader.onrender.com';
+
+const POLL_INTERVAL_MS = 2000;
+const MAX_POLL_ATTEMPTS = 30;
+const JOB_TIMEOUT_MS = 60_000;
+
+function getTempDir(): string {
+  const dir = path.join(os.tmpdir(), 'musify-downloads');
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  return dir;
+}
+
+export function cleanupTempFile(filePath?: string): void {
+  if (!filePath) return;
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      logger.info('[IG] Cleaned up temp file', { filePath });
+    }
+  } catch (err) {
+    logger.warn('[IG] Failed to clean up temp file', { filePath, error: err });
+  }
 }
 
 /**
@@ -83,120 +112,136 @@ export function sanitizeForLog(obj: unknown): unknown {
 }
 
 /**
- * Service abstraction for retrieving Instagram Reel video and media URLs.
- * Separated cleanly so provider implementations can be swapped without touching bot logic.
+ * Extracts a direct media URL from a provider response body.
+ * Handles multiple response shapes from various providers.
+ */
+function extractMediaUrlFromResponse(data: Record<string, unknown>): string | null {
+  const nested = data.data && typeof data.data === 'object' ? (data.data as Record<string, unknown>) : null;
+
+  const candidates = [
+    nested?.downloadUrl,
+    nested?.video_url,
+    nested?.media_url,
+    nested?.url,
+    data.video_url,
+    data.media_url,
+    data.url,
+    data.download_url,
+    data.file_url,
+    data.content_url,
+    (Array.isArray(data.urls) && data.urls[0] && (data.urls[0] as Record<string, unknown>).url),
+    (Array.isArray(data.data) && data.data[0] && (data.data[0] as Record<string, unknown>).url),
+    (data.result && typeof data.result === 'object' ? (data.result as Record<string, unknown>).video_url : undefined),
+    (data.result && typeof data.result === 'object' ? (data.result as Record<string, unknown>).download_url : undefined),
+    (data.result && typeof data.result === 'object' ? (data.result as Record<string, unknown>).url : undefined),
+    (data.result && typeof data.result === 'object' && (data.result as Record<string, unknown>).download
+      ? ((data.result as Record<string, unknown>).download as Record<string, unknown>).url
+      : undefined),
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && !isInstagramPageUrl(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Service for retrieving Instagram Reel video via the self-hosted Render downloader.
+ *
+ * Flow:
+ * 1. POST /api/info  — validate reel URL and get metadata
+ * 2. POST /api/jobs  — create a download job
+ * 3. GET  /api/jobs/:id — poll until job completes
+ * 4. GET  /api/jobs/:id/file — download the video file
  */
 export async function getInstagramReel(url: string): Promise<InstagramReelMedia> {
   const { shortcode, normalizedUrl } = validateAndNormalizeInstagramUrl(url);
 
-  const apiUrl = process.env.INSTAGRAM_API_URL;
-  const apiKey = process.env.INSTAGRAM_API_KEY;
-
   logger.info('[IG] Instagram request started', {
     shortcode,
-    instagramApiUrlConfigured: !!apiUrl,
-    instagramApiKeyConfigured: !!apiKey,
+    renderDownloaderUrl: RENDER_DOWNLOADER_URL,
   });
 
-  if (!apiUrl) {
-    throw new InstagramApiError('Instagram API endpoint is not configured. Please set INSTAGRAM_API_URL in environment.');
-  }
-
-  if (!apiKey) {
-    throw new InstagramApiError('Instagram API key is not configured. Please set INSTAGRAM_API_KEY in environment.');
-  }
-
   try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'x-access-key': apiKey,
-    };
+    // 1. POST /api/info — validate reel and get metadata
+    logger.info('[IG] Step 1: Validating reel via /api/info');
+    const infoResponse = await axios.post(
+      `${RENDER_DOWNLOADER_URL}/api/info`,
+      { url: normalizedUrl },
+      { timeout: 30_000 }
+    );
+    logger.info('[IG] /api/info response status:', infoResponse.status);
+    logger.info('[IG] /api/info response body:', sanitizeForLog(infoResponse.data));
 
-    const response = await axios.post(apiUrl, {
-      url: normalizedUrl,
-      access_key: apiKey,
-      format: 'mp4',
-      quality: '720p',
-    }, {
-      headers,
-      timeout: 12000,
-    });
-
-    logger.info('[IG] Instagram API response status:', response.status);
-    logger.info('[IG] Instagram API response body:', sanitizeForLog(response.data));
-
-    const data = response.data;
-
-    if (!data) {
-      throw new InstagramApiError('Empty response from Instagram extraction service.');
+    const infoData = infoResponse.data;
+    if (!infoData) {
+      throw new InstagramApiError('Empty response from downloader /api/info endpoint.');
     }
 
-    // Flexible extraction mapping to support SocialKit API responses.
-    // SocialKit returns { success, data: { downloadUrl, title, ... } }.
-    // Also handles legacy flat response shapes for backward compatibility.
+    // Check if the provider explicitly says the reel is private/deleted
+    const infoMsg = (infoData.message || infoData.error || '').toLowerCase();
+    if (
+      infoMsg.includes('private') ||
+      infoMsg.includes('deleted') ||
+      infoMsg.includes('unavailable') ||
+      (infoMsg.includes('reel') && infoMsg.includes('not found'))
+    ) {
+      logger.error('[IG] Provider explicitly reports reel as private/deleted/unavailable');
+      throw new PrivateOrDeletedReelError();
+    }
 
-    const nested = data.data && typeof data.data === 'object' ? data.data : null;
+    const title = infoData.title || infoData.caption || infoData.description || undefined;
+    const thumbnailUrl = infoData.thumbnail || infoData.thumbnail_url || infoData.cover || undefined;
 
-    const videoUrl =
-      (nested && nested.downloadUrl) ||
-      (nested && nested.video_url) ||
-      (nested && nested.media_url) ||
-      (nested && nested.url && !isInstagramPageUrl(nested.url) && nested.url) ||
-      data.video_url ||
-      data.media_url ||
-      (data.url && !isInstagramPageUrl(data.url) && data.url) ||
-      data.download_url ||
-      data.file_url ||
-      data.content_url ||
-      (Array.isArray(data.urls) && data.urls[0]?.url) ||
-      (Array.isArray(data.data) && data.data[0]?.url) ||
-      (data.result && (data.result.video_url || data.result.download_url || data.result.url || data.result[0]?.url)) ||
-      (data.result?.download?.url);
+    // 2. POST /api/jobs — create download job
+    logger.info('[IG] Step 2: Creating download job via /api/jobs');
+    const jobResponse = await axios.post(
+      `${RENDER_DOWNLOADER_URL}/api/jobs`,
+      { url: normalizedUrl, format: 'mp4', quality: '720p' },
+      { timeout: 30_000 }
+    );
+    logger.info('[IG] /api/jobs response status:', jobResponse.status);
+    logger.info('[IG] /api/jobs response body:', sanitizeForLog(jobResponse.data));
 
-    const audioUrl =
-      (nested && nested.audio_url) ||
-      (nested && nested.music_url) ||
-      data.audio_url ||
-      data.music_url ||
-      (data.result && (data.result.audio_url || data.result.music_url));
+    const jobData = jobResponse.data;
+    if (!jobData) {
+      throw new InstagramApiError('Empty response from downloader /api/jobs endpoint.');
+    }
 
-    const thumbnailUrl =
-      (nested && nested.thumbnail) ||
-      (nested && nested.thumbnail_url) ||
-      data.thumbnail_url ||
-      data.cover_url ||
-      data.thumbnail ||
-      (data.result && data.result.thumbnail);
-
-    const title =
-      (nested && nested.title) ||
-      (nested && nested.caption) ||
-      data.title ||
-      data.caption ||
-      (data.result && (data.result.title || data.result.caption));
-
-    logger.info('[IG] Instagram media URLs extracted:', videoUrl ? 1 : 0);
-
-    if (!videoUrl) {
-      logger.error('[IG] No video URL found in response');
-      const msg = (data.message || data.error || '').toLowerCase();
-      if (
-        msg.includes('private') ||
-        msg.includes('deleted') ||
-        msg.includes('unavailable') ||
-        (msg.includes('reel') && msg.includes('not found'))
-      ) {
-        logger.error('[IG] Provider explicitly reports reel as private/deleted/unavailable');
-        throw new PrivateOrDeletedReelError();
+    const jobId = jobData.jobId || jobData.id || jobData.job_id;
+    if (!jobId) {
+      // Some APIs might return the file URL directly without a job ID
+      const directUrl = extractMediaUrlFromResponse(jobData);
+      if (directUrl) {
+        logger.info('[IG] Direct file URL returned from /api/jobs');
+        const videoFilePath = await downloadToTempFile(directUrl, shortcode);
+        return {
+          id: shortcode,
+          mediaUrl: directUrl,
+          videoFilePath,
+          title,
+          thumbnailUrl: thumbnailUrl || undefined,
+        };
       }
-      throw new InstagramApiError('Could not find downloadable media URL in response.');
+      throw new InstagramApiError('No job ID or direct file URL returned from downloader.');
     }
+
+    // 3. GET /api/jobs/:id — poll until job completes
+    logger.info('[IG] Step 3: Polling job status', { jobId });
+    const fileUrl = await pollJobStatus(jobId);
+
+    // 4. GET /api/jobs/:id/file — download the video file
+    logger.info('[IG] Step 4: Downloading video file');
+    const videoFilePath = await downloadToTempFile(fileUrl, shortcode);
 
     return {
       id: shortcode,
-      mediaUrl: videoUrl,
-      audioUrl: audioUrl || undefined,
-      title: title || undefined,
+      mediaUrl: fileUrl,
+      videoFilePath,
+      title,
       thumbnailUrl: thumbnailUrl || undefined,
     };
   } catch (error: unknown) {
@@ -209,29 +254,16 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
 
     if (axios.isAxiosError(error)) {
       const status = error.response?.status;
-      const providerMsg = error.response?.data?.message || error.response?.data?.error || error.message;
+      const providerMsg =
+        error.response?.data?.message ||
+        error.response?.data?.error ||
+        error.message;
 
-      logger.error(`[IG] Instagram API HTTP ${status || 'unknown'}`, providerMsg);
+      logger.error(`[IG] Downloader HTTP ${status || 'unknown'}`, providerMsg);
 
       const lowerMsg = (providerMsg || '').toLowerCase();
 
-      // Detect monthly quota / credit exhaustion (SocialKit returns 403 for this)
-      const isQuotaError = (
-        status === 403 || status === 429
-      ) && (
-        lowerMsg.includes('limit') ||
-        lowerMsg.includes('quota') ||
-        lowerMsg.includes('credit') ||
-        lowerMsg.includes('exceeded') ||
-        lowerMsg.includes('exhausted')
-      );
-
-      if (isQuotaError) {
-        logger.error('[IG] Provider monthly quota/request limit exhausted');
-        throw new ProviderQuotaExhaustedError('SocialKit', providerMsg || undefined);
-      }
-
-      // Only treat as private/deleted when the provider explicitly says so.
+      // Only treat as private/deleted when the provider explicitly says so
       if (
         lowerMsg.includes('private') ||
         lowerMsg.includes('deleted') ||
@@ -242,7 +274,9 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
         throw new PrivateOrDeletedReelError();
       }
 
-      throw new InstagramApiError(`Extraction provider returned HTTP ${status || 'error'}: ${providerMsg}`);
+      throw new InstagramApiError(
+        `Downloader returned HTTP ${status || 'error'}: ${providerMsg}`
+      );
     }
 
     logger.error('[IG] Unexpected error fetching Instagram Reel', error);
@@ -250,3 +284,98 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
   }
 }
 
+/**
+ * Polls the job status endpoint until the job completes or times out.
+ * Returns the file URL when ready.
+ */
+async function pollJobStatus(jobId: string): Promise<string> {
+  for (let attempt = 1; attempt <= MAX_POLL_ATTEMPTS; attempt++) {
+    await sleep(POLL_INTERVAL_MS);
+
+    try {
+      const statusResponse = await axios.get(
+        `${RENDER_DOWNLOADER_URL}/api/jobs/${jobId}`,
+        { timeout: 15_000 }
+      );
+
+      const data = statusResponse.data;
+      const status = (data.status || data.state || '').toLowerCase();
+
+      logger.info('[IG] Job poll', { jobId, attempt, status });
+
+      if (status === 'completed' || status === 'done' || status === 'finished' || status === 'success') {
+        // Job completed — extract file URL
+        const fileUrl =
+          data.fileUrl ||
+          data.file_url ||
+          data.downloadUrl ||
+          data.download_url ||
+          data.url ||
+          (data.result && typeof data.result === 'object'
+            ? (data.result as Record<string, unknown>).url ||
+              (data.result as Record<string, unknown>).file_url ||
+              (data.result as Record<string, unknown>).download_url
+            : undefined);
+
+        if (fileUrl && typeof fileUrl === 'string') {
+          return fileUrl;
+        }
+
+        // If no direct file URL, construct it from the job ID
+        return `${RENDER_DOWNLOADER_URL}/api/jobs/${jobId}/file`;
+      }
+
+      if (status === 'failed' || status === 'error') {
+        const errorMsg = data.error || data.message || 'Download job failed';
+        throw new InstagramApiError(`Download job failed: ${errorMsg}`);
+      }
+
+      // Job still processing — continue polling
+    } catch (err: unknown) {
+      if (err instanceof InstagramApiError) throw err;
+      if (axios.isAxiosError(err)) {
+        logger.warn('[IG] Job poll HTTP error', {
+          jobId,
+          attempt,
+          status: err.response?.status,
+          message: err.message,
+        });
+      } else {
+        logger.warn('[IG] Job poll unexpected error', { jobId, attempt, error: err });
+      }
+      // Continue polling on transient errors
+    }
+  }
+
+  throw new InstagramApiError(
+    `Download job timed out after ${MAX_POLL_ATTEMPTS * POLL_INTERVAL_MS / 1000}s. The Render server may be cold-starting.`
+  );
+}
+
+/**
+ * Downloads a file from a URL to a temp file and returns the local path.
+ */
+async function downloadToTempFile(url: string, shortcode: string): Promise<string> {
+  const tempDir = getTempDir();
+  const filePath = path.join(tempDir, `${shortcode}_${Date.now()}.mp4`);
+
+  const response = await axios.get(url, {
+    responseType: 'arraybuffer',
+    timeout: 60_000,
+    maxRedirects: 5,
+  });
+
+  const buffer = Buffer.from(response.data);
+  fs.writeFileSync(filePath, buffer);
+
+  logger.info('[IG] Downloaded video to temp file', {
+    filePath,
+    size: buffer.length,
+  });
+
+  return filePath;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

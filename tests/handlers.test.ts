@@ -12,14 +12,19 @@ import * as musicService from '../lib/services/music-recognition';
 import * as audioSource from '../lib/services/audio-source';
 import * as cacheService from '../lib/services/cache';
 import { MusicNotFoundError } from '../lib/utils/errors';
+import fs from 'fs';
 
 vi.mock('../lib/services/instagram');
 vi.mock('../lib/services/music-recognition');
 vi.mock('../lib/services/audio-source');
+vi.mock('fs');
 
 describe('Telegram Bot Handlers', () => {
+  const mockedFs = vi.mocked(fs, true);
+
   beforeEach(() => {
     vi.clearAllMocks();
+    mockedFs.existsSync.mockReturnValue(false);
   });
 
   describe('formatReleaseDate', () => {
@@ -63,7 +68,6 @@ describe('Telegram Bot Handlers', () => {
       expect(caption).toContain('Kendrick Lamar');
       expect(caption).toContain('Mr. Morale & The Big Steppers');
       expect(caption).toContain('13 May 2022');
-      // Must NOT truncate to just year
       expect(caption).not.toMatch(/📅 2022$/m);
     });
 
@@ -93,15 +97,15 @@ describe('Telegram Bot Handlers', () => {
 
       const success = await sendReelVideoToTelegram(
         mockCtx,
-        'https://cdn.socialkit.dev/video.mp4',
-        'DRU4smMj0cu',
+        'https://cdn.render.com/video.mp4',
+        'TEST123',
         'Test Caption'
       );
 
       expect(success).toBe(true);
       expect(mockCtx.api.sendVideo).toHaveBeenCalledWith(
         12345,
-        'https://cdn.socialkit.dev/video.mp4',
+        'https://cdn.render.com/video.mp4',
         expect.objectContaining({ caption: 'Test Caption', parse_mode: 'Markdown' })
       );
     });
@@ -122,8 +126,8 @@ describe('Telegram Bot Handlers', () => {
 
       const success = await sendReelVideoToTelegram(
         mockCtx,
-        'https://cdn.socialkit.dev/video.mp4',
-        'DRU4smMj0cu',
+        'https://cdn.render.com/video.mp4',
+        'TEST123',
         'Test Caption'
       );
 
@@ -133,7 +137,7 @@ describe('Telegram Bot Handlers', () => {
   });
 
   describe('handleTextMessage', () => {
-    it('should process Instagram Reel URL, recognize song, and send ONE video message with caption and button', async () => {
+    it('should process Instagram Reel URL, recognize song, send video with caption+button via single status message flow', async () => {
       vi.spyOn(cacheService, 'getCachedJobByShortcode').mockResolvedValue(null);
       vi.spyOn(cacheService, 'cacheJobByShortcode').mockResolvedValue(undefined);
       vi.spyOn(cacheService, 'saveReelJob').mockResolvedValue('mock-job-id');
@@ -145,18 +149,21 @@ describe('Telegram Bot Handlers', () => {
         reply: vi.fn().mockResolvedValue({ message_id: 100 }),
         api: {
           sendVideo: vi.fn().mockResolvedValue({ message_id: 101 }),
+          editMessageText: vi.fn().mockResolvedValue(true),
           deleteMessage: vi.fn().mockResolvedValue(true),
         },
       } as unknown as Context;
 
       const mockMedia = {
         id: 'DRU4smMj0cu',
-        mediaUrl: 'https://cdn.socialkit.dev/video.mp4',
+        mediaUrl: 'https://cdn.render.com/video.mp4',
+        videoFilePath: '/tmp/DRU4smMj0cu.mp4',
       };
       vi.spyOn(instagramService, 'getInstagramReel').mockResolvedValueOnce(mockMedia);
+      vi.spyOn(instagramService, 'cleanupTempFile').mockImplementation(() => {});
 
-      const mockBuffer = Buffer.from('mock video bytes');
-      vi.spyOn(musicService, 'downloadMediaBuffer').mockResolvedValueOnce(mockBuffer);
+      mockedFs.existsSync.mockReturnValue(true);
+      mockedFs.readFileSync.mockReturnValue(Buffer.from('mock video bytes'));
 
       const mockSong = {
         artist: 'Kendrick Lamar',
@@ -168,25 +175,30 @@ describe('Telegram Bot Handlers', () => {
 
       await handleTextMessage(mockCtx);
 
-      // Status message sent with new format
+      // Status message sent initially
       expect(mockCtx.reply).toHaveBeenCalledWith('🎬 Reel qabul qilindi\n⏳ Video olinmoqda...');
+
+      // Status message was edited
+      expect(mockCtx.api.editMessageText).toHaveBeenCalled();
 
       // ONE sendVideo call with caption containing full date
       expect(mockCtx.api.sendVideo).toHaveBeenCalledTimes(1);
-      const sendVideoCall = mockCtx.api.sendVideo.mock.calls[0];
+      const sendVideoCall = (mockCtx.api.sendVideo as any).mock.calls[0];
       expect(sendVideoCall[0]).toBe(12345);
-      expect(sendVideoCall[1]).toBe('https://cdn.socialkit.dev/video.mp4');
+      expect(sendVideoCall[1]).toBe('https://cdn.render.com/video.mp4');
       const options = sendVideoCall[2];
       expect(options.caption).toContain('13 May 2022');
       expect(options.parse_mode).toBe('Markdown');
-      // reply_markup is an InlineKeyboard instance
       const keyboard = options.reply_markup;
       expect(keyboard.inline_keyboard).toBeDefined();
       expect(keyboard.inline_keyboard[0][0].text).toBe('🎧 QO\u2018SHIQNI OLISH');
       expect(keyboard.inline_keyboard[0][0].callback_data).toMatch(/^get_song:[a-f0-9]+$/);
 
-      // Status message cleaned up
+      // Status message deleted after video sent
       expect(mockCtx.api.deleteMessage).toHaveBeenCalledWith(12345, 100);
+
+      // Temp file cleaned up
+      expect(instagramService.cleanupTempFile).toHaveBeenCalledWith('/tmp/DRU4smMj0cu.mp4');
     });
 
     it('should send video with fallback caption when music recognition finds no match', async () => {
@@ -201,16 +213,17 @@ describe('Telegram Bot Handlers', () => {
         reply: vi.fn().mockResolvedValue({ message_id: 100 }),
         api: {
           sendVideo: vi.fn().mockResolvedValue({ message_id: 101 }),
+          editMessageText: vi.fn().mockResolvedValue(true),
           deleteMessage: vi.fn().mockResolvedValue(true),
         },
       } as unknown as Context;
 
       const mockMedia = {
         id: 'DRU4smMj0cu',
-        mediaUrl: 'https://cdn.socialkit.dev/video.mp4',
+        mediaUrl: 'https://cdn.render.com/video.mp4',
       };
       vi.spyOn(instagramService, 'getInstagramReel').mockResolvedValueOnce(mockMedia);
-      vi.spyOn(musicService, 'downloadMediaBuffer').mockResolvedValueOnce(Buffer.from('video bytes'));
+      vi.spyOn(instagramService, 'cleanupTempFile').mockImplementation(() => {});
       vi.spyOn(musicService, 'identifySong').mockRejectedValueOnce(new MusicNotFoundError());
 
       await handleTextMessage(mockCtx);
@@ -218,7 +231,7 @@ describe('Telegram Bot Handlers', () => {
       expect(mockCtx.api.sendVideo).toHaveBeenCalledTimes(1);
       expect(mockCtx.api.sendVideo).toHaveBeenCalledWith(
         12345,
-        'https://cdn.socialkit.dev/video.mp4',
+        'https://cdn.render.com/video.mp4',
         expect.objectContaining({
           caption: '🎵 Musiqa aniqlanmadi.',
         })
@@ -229,7 +242,7 @@ describe('Telegram Bot Handlers', () => {
       const existingJob = {
         jobId: 'existing123',
         reelUrl: 'https://www.instagram.com/reel/DRU4smMj0cu/',
-        mediaUrl: 'https://cdn.socialkit.dev/video.mp4',
+        mediaUrl: 'https://cdn.render.com/video.mp4',
         shortcode: 'DRU4smMj0cu',
         createdAt: Date.now(),
         songTitle: 'United In Grief',
@@ -252,15 +265,13 @@ describe('Telegram Bot Handlers', () => {
 
       await handleTextMessage(mockCtx);
 
-      // Should NOT call Instagram or ACRCloud
       expect(instagramService.getInstagramReel).not.toHaveBeenCalled();
       expect(musicService.identifySong).not.toHaveBeenCalled();
 
-      // Should send video with existing recognition
       expect(mockCtx.api.sendVideo).toHaveBeenCalledTimes(1);
       expect(mockCtx.api.sendVideo).toHaveBeenCalledWith(
         12345,
-        'https://cdn.socialkit.dev/video.mp4',
+        'https://cdn.render.com/video.mp4',
         expect.objectContaining({
           caption: expect.stringContaining('United In Grief'),
         })
@@ -269,11 +280,12 @@ describe('Telegram Bot Handlers', () => {
   });
 
   describe('handleCallbackQuery - get_song', () => {
-    it('should fetch audio and send it to the user when get_song button is pressed', async () => {
+    it('should fall back to audio-source search when no cached video file exists', async () => {
       const mockJob = {
         jobId: 'abc123',
         reelUrl: 'https://www.instagram.com/reel/DRU4smMj0cu/',
-        mediaUrl: 'https://cdn.socialkit.dev/video.mp4',
+        mediaUrl: 'https://cdn.render.com/video.mp4',
+        // no videoFilePath — triggers fallback
         shortcode: 'DRU4smMj0cu',
         createdAt: Date.now(),
         songTitle: 'United In Grief',
@@ -292,6 +304,7 @@ describe('Telegram Bot Handlers', () => {
 
       const mockCtx = {
         from: { id: 999 },
+        chat: { id: 12345 },
         callbackQuery: {
           data: 'get_song:abc123',
           message: { chat: { id: 12345 }, message_id: 200 },
@@ -305,7 +318,6 @@ describe('Telegram Bot Handlers', () => {
 
       await handleCallbackQuery(mockCtx);
 
-      expect(mockCtx.answerCallbackQuery).toHaveBeenCalled();
       expect(audioSource.getSongAudio).toHaveBeenCalledWith('United In Grief', 'Kendrick Lamar');
       expect(mockCtx.api.sendAudio).toHaveBeenCalledWith(
         12345,
@@ -323,6 +335,7 @@ describe('Telegram Bot Handlers', () => {
 
       const mockCtx = {
         from: { id: 999 },
+        chat: { id: 12345 },
         callbackQuery: {
           data: 'get_song:missing123',
           message: { chat: { id: 12345 }, message_id: 200 },
@@ -345,17 +358,18 @@ describe('Telegram Bot Handlers', () => {
       const mockJob = {
         jobId: 'abc123',
         reelUrl: 'https://www.instagram.com/reel/DRU4smMj0cu/',
-        mediaUrl: 'https://cdn.socialkit.dev/video.mp4',
+        mediaUrl: 'https://cdn.render.com/video.mp4',
         shortcode: 'DRU4smMj0cu',
         createdAt: Date.now(),
         songTitle: 'United In Grief',
         songArtist: 'Kendrick Lamar',
-        userId: 999, // Original user
+        userId: 999,
       };
       vi.spyOn(cacheService, 'getReelJob').mockResolvedValueOnce(mockJob);
 
       const mockCtx = {
-        from: { id: 1111 }, // Different user trying to access
+        from: { id: 1111 },
+        chat: { id: 12345 },
         callbackQuery: {
           data: 'get_song:abc123',
           message: { chat: { id: 12345 }, message_id: 200 },
@@ -370,9 +384,8 @@ describe('Telegram Bot Handlers', () => {
 
       expect(mockCtx.api.sendMessage).toHaveBeenCalledWith(
         12345,
-        expect.stringContaining('so\'rovngiz emas')
+        expect.stringContaining("so'rovngiz emas")
       );
-      // Should NOT attempt to download audio
       expect(audioSource.getSongAudio).not.toHaveBeenCalled();
     });
 
@@ -380,12 +393,11 @@ describe('Telegram Bot Handlers', () => {
       const mockJob = {
         jobId: 'abc123',
         reelUrl: 'https://www.instagram.com/reel/DRU4smMj0cu/',
-        mediaUrl: 'https://cdn.socialkit.dev/video.mp4',
+        mediaUrl: 'https://cdn.render.com/video.mp4',
         shortcode: 'DRU4smMj0cu',
         createdAt: Date.now(),
         songTitle: 'Test Song',
         songArtist: 'Test Artist',
-        // No userId set (old job format)
       };
       vi.spyOn(cacheService, 'getReelJob').mockResolvedValueOnce(mockJob);
 
@@ -399,6 +411,7 @@ describe('Telegram Bot Handlers', () => {
 
       const mockCtx = {
         from: { id: 1111 },
+        chat: { id: 12345 },
         callbackQuery: {
           data: 'get_song:abc123',
           message: { chat: { id: 12345 }, message_id: 200 },
@@ -412,7 +425,6 @@ describe('Telegram Bot Handlers', () => {
 
       await handleCallbackQuery(mockCtx);
 
-      // Should proceed with audio download (no userId to check against)
       expect(audioSource.getSongAudio).toHaveBeenCalledWith('Test Song', 'Test Artist');
       expect(mockCtx.api.sendAudio).toHaveBeenCalled();
     });
