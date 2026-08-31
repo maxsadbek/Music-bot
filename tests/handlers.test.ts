@@ -1,20 +1,55 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { Context } from 'grammy';
-import { formatSongCaption, handleTextMessage, sendReelVideoToTelegram } from '../lib/bot/handlers';
+import {
+  formatReleaseDate,
+  formatSongCaption,
+  handleTextMessage,
+  handleCallbackQuery,
+  sendReelVideoToTelegram,
+} from '../lib/bot/handlers';
 import * as instagramService from '../lib/services/instagram';
 import * as musicService from '../lib/services/music-recognition';
+import * as audioSource from '../lib/services/audio-source';
+import * as cacheService from '../lib/services/cache';
 import { MusicNotFoundError } from '../lib/utils/errors';
 
 vi.mock('../lib/services/instagram');
 vi.mock('../lib/services/music-recognition');
+vi.mock('../lib/services/audio-source');
 
 describe('Telegram Bot Handlers', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
+  describe('formatReleaseDate', () => {
+    it('should format YYYY-MM-DD to "DD Month YYYY"', () => {
+      expect(formatReleaseDate('2022-05-13')).toBe('13 May 2022');
+    });
+
+    it('should format YYYY-MM to "Month YYYY"', () => {
+      expect(formatReleaseDate('2022-05')).toBe('May 2022');
+    });
+
+    it('should return just year when only year is available', () => {
+      expect(formatReleaseDate('2022')).toBe('2022');
+    });
+
+    it('should handle January correctly', () => {
+      expect(formatReleaseDate('2020-01-05')).toBe('5 January 2020');
+    });
+
+    it('should handle December correctly', () => {
+      expect(formatReleaseDate('2023-12-25')).toBe('25 December 2023');
+    });
+
+    it('should format ACRCloud YYYYMMDD dates to "DD Month YYYY"', () => {
+      expect(formatReleaseDate('20220513')).toBe('13 May 2022');
+    });
+  });
+
   describe('formatSongCaption', () => {
-    it('should format song metadata into minimal caption string with track title, artist, album, and release year', () => {
+    it('should format song into "🎵 track - artist" with album and full date', () => {
       const song = {
         title: 'United In Grief',
         artist: 'Kendrick Lamar',
@@ -24,13 +59,26 @@ describe('Telegram Bot Handlers', () => {
 
       const caption = formatSongCaption(song);
 
-      expect(caption).toBe(
-        '🎵 *United In Grief*\n' +
-        '   Kendrick Lamar\n\n' +
-        '━━━━━━━━━━━━━━━━━━\n' +
-        '💿 Mr. Morale & The Big Steppers\n' +
-        '📅 2022'
-      );
+      expect(caption).toContain('United In Grief');
+      expect(caption).toContain('Kendrick Lamar');
+      expect(caption).toContain('Mr. Morale & The Big Steppers');
+      expect(caption).toContain('13 May 2022');
+      // Must NOT truncate to just year
+      expect(caption).not.toMatch(/📅 2022$/m);
+    });
+
+    it('should work without album or release date', () => {
+      const song = {
+        title: 'Test Track',
+        artist: 'Test Artist',
+      };
+
+      const caption = formatSongCaption(song);
+
+      expect(caption).toContain('Test Track');
+      expect(caption).toContain('Test Artist');
+      expect(caption).not.toContain('💿');
+      expect(caption).not.toContain('📅');
     });
   });
 
@@ -116,17 +164,31 @@ describe('Telegram Bot Handlers', () => {
 
       await handleTextMessage(mockCtx);
 
+      // Status message sent
       expect(mockCtx.reply).toHaveBeenCalledWith('⏳ Video va musiqa yuklanmoqda...');
 
+      // ONE sendVideo call with caption containing full date
+      expect(mockCtx.api.sendVideo).toHaveBeenCalledTimes(1);
       expect(mockCtx.api.sendVideo).toHaveBeenCalledWith(
         12345,
         'https://cdn.socialkit.dev/video.mp4',
         expect.objectContaining({
-          caption: expect.stringContaining('United In Grief'),
+          caption: expect.stringContaining('13 May 2022'),
           parse_mode: 'Markdown',
+          reply_markup: expect.objectContaining({
+            inline_keyboard: expect.arrayContaining([
+              expect.arrayContaining([
+                expect.objectContaining({
+                  text: '🎧 QO‘SHIQNI OLISH',
+                  callback_data: expect.stringMatching(/^get_song:[a-f0-9]+$/),
+                }),
+              ]),
+            ]),
+          }),
         })
       );
 
+      // Status message cleaned up
       expect(mockCtx.api.deleteMessage).toHaveBeenCalledWith(12345, 100);
     });
 
@@ -152,12 +214,86 @@ describe('Telegram Bot Handlers', () => {
 
       await handleTextMessage(mockCtx);
 
+      expect(mockCtx.api.sendVideo).toHaveBeenCalledTimes(1);
       expect(mockCtx.api.sendVideo).toHaveBeenCalledWith(
         12345,
         'https://cdn.socialkit.dev/video.mp4',
         expect.objectContaining({
           caption: '🎵 Musiqa aniqlanmadi.',
         })
+      );
+    });
+  });
+
+  describe('handleCallbackQuery - get_song', () => {
+    it('should fetch audio and send it to the user when get_song button is pressed', async () => {
+      const mockJob = {
+        jobId: 'abc123',
+        reelUrl: 'https://www.instagram.com/reel/DRU4smMj0cu/',
+        mediaUrl: 'https://cdn.socialkit.dev/video.mp4',
+        shortcode: 'DRU4smMj0cu',
+        createdAt: Date.now(),
+        songTitle: 'United In Grief',
+        songArtist: 'Kendrick Lamar',
+      };
+      vi.spyOn(cacheService, 'getReelJob').mockResolvedValueOnce(mockJob);
+
+      const mockAudio = {
+        buffer: Buffer.from('mock audio data'),
+        title: 'United In Grief',
+        artist: 'Kendrick Lamar',
+        durationSeconds: 240,
+      };
+      vi.spyOn(audioSource, 'getSongAudio').mockResolvedValueOnce(mockAudio);
+
+      const mockCtx = {
+        from: { id: 999 },
+        callbackQuery: {
+          data: 'get_song:abc123',
+          message: { chat: { id: 12345 }, message_id: 200 },
+        },
+        answerCallbackQuery: vi.fn().mockResolvedValue(true),
+        api: {
+          sendMessage: vi.fn().mockResolvedValue({ message_id: 201 }),
+          sendAudio: vi.fn().mockResolvedValue({ message_id: 202 }),
+        },
+      } as unknown as Context;
+
+      await handleCallbackQuery(mockCtx);
+
+      expect(mockCtx.answerCallbackQuery).toHaveBeenCalled();
+      expect(audioSource.getSongAudio).toHaveBeenCalledWith('United In Grief', 'Kendrick Lamar');
+      expect(mockCtx.api.sendAudio).toHaveBeenCalledWith(
+        12345,
+        expect.anything(),
+        expect.objectContaining({
+          title: 'United In Grief',
+          performer: 'Kendrick Lamar',
+          duration: 240,
+        })
+      );
+    });
+
+    it('should send error message when job is not found in cache', async () => {
+      vi.spyOn(cacheService, 'getReelJob').mockResolvedValueOnce(null);
+
+      const mockCtx = {
+        from: { id: 999 },
+        callbackQuery: {
+          data: 'get_song:missing123',
+          message: { chat: { id: 12345 }, message_id: 200 },
+        },
+        answerCallbackQuery: vi.fn().mockResolvedValue(true),
+        api: {
+          sendMessage: vi.fn().mockResolvedValue({ message_id: 201 }),
+        },
+      } as unknown as Context;
+
+      await handleCallbackQuery(mockCtx);
+
+      expect(mockCtx.api.sendMessage).toHaveBeenCalledWith(
+        12345,
+        expect.stringContaining('topilmadi')
       );
     });
   });

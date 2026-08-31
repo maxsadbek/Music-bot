@@ -6,34 +6,81 @@ import {
 } from '../validation/instagram';
 import { getInstagramReel } from '../services/instagram';
 import { downloadMediaBuffer, identifySong, SongResult } from '../services/music-recognition';
+import { getSongAudio, AudioSourceError } from '../services/audio-source';
 import { generateJobId, getReelJob, ReelJobData, saveReelJob } from '../services/cache';
 import { checkRateLimit } from '../services/rate-limit';
-import {
-  buildFindMusicKeyboard,
-  buildGetSongKeyboard,
-  buildRetryKeyboard,
-} from './keyboards';
+import { buildGetSongKeyboard } from './keyboards';
 import {
   formatErrorMessage,
   MusicNotFoundError,
   RateLimitError,
 } from '../utils/errors';
 
+const MONTHS: Record<string, string> = {
+  '01': 'January', '02': 'February', '03': 'March',
+  '04': 'April', '05': 'May', '06': 'June',
+  '07': 'July', '08': 'August', '09': 'September',
+  '10': 'October', '11': 'November', '12': 'December',
+};
+
 /**
- * Formats song metadata into minimal, premium Telegram video caption.
+ * Formats an ISO date string (YYYY-MM-DD, YYYY-MM, or YYYY) into "DD Month YYYY".
+ * If only a year is available, returns just the year.
+ */
+export function formatReleaseDate(dateStr: string): string {
+  const trimmed = dateStr.trim();
+
+  // ACRCloud may return YYYYMMDD without separators
+  if (/^\d{8}$/.test(trimmed)) {
+    const year = trimmed.slice(0, 4);
+    const month = trimmed.slice(4, 6);
+    const day = trimmed.slice(6, 8);
+    const dayNum = parseInt(day, 10);
+    const monthName = MONTHS[month] || month;
+    return `${dayNum} ${monthName} ${year}`;
+  }
+
+  const parts = trimmed.split('-');
+  const year = parts[0];
+  const month = parts[1];
+  const day = parts[2];
+
+  if (year && month && day) {
+    const dayNum = parseInt(day, 10);
+    const monthName = MONTHS[month] || month;
+    return `${dayNum} ${monthName} ${year}`;
+  }
+  if (year && month) {
+    const monthName = MONTHS[month] || month;
+    return `${monthName} ${year}`;
+  }
+  return year || dateStr;
+}
+
+/**
+ * Formats song metadata into the final minimal premium Telegram video caption.
+ *
+ * Format:
+ * 🎵 {track} - {artist}
+ *
+ * 💿 {album}
+ * 📅 {full date}
  */
 export function formatSongCaption(song: SongResult): string {
   const title = escapeMarkdown(song.title);
   const artist = escapeMarkdown(song.artist);
-  const album = song.album ? escapeMarkdown(song.album) : undefined;
-  const year = song.releaseDate ? song.releaseDate.slice(0, 4) : undefined;
 
-  let caption = `🎵 *${title}*\n   ${artist}`;
-  if (album || year) {
-    caption += `\n\n━━━━━━━━━━━━━━━━━━`;
+  let caption = `🎵 ${title} \\- ${artist}`;
+
+  const album = song.album ? escapeMarkdown(song.album) : undefined;
+  const date = song.releaseDate ? formatReleaseDate(song.releaseDate) : undefined;
+
+  if (album || date) {
+    caption += '\n';
     if (album) caption += `\n💿 ${album}`;
-    if (year) caption += `\n📅 ${year}`;
+    if (date) caption += `\n📅 ${date}`;
   }
+
   return caption;
 }
 
@@ -191,15 +238,15 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       logger.warn('Pre-downloading media buffer failed, fallback to URL download for recognition', downloadErr);
     }
 
-    // 3. Save job to cache
+    // 3. Save job to cache (will be updated with song data after recognition)
     const jobId = generateJobId();
-    await saveReelJob({
+    const jobData: ReelJobData = {
       jobId,
       reelUrl: normalizedUrl,
       mediaUrl: reelMedia.mediaUrl,
       shortcode: reelMedia.id || shortcode,
       createdAt: Date.now(),
-    });
+    };
 
     // 4. Perform ACRCloud music recognition
     let captionText = '🎵 Musiqa aniqlanmadi.';
@@ -209,15 +256,20 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       const song = await identifySong(downloadedBuffer || reelMedia.mediaUrl);
       captionText = formatSongCaption(song);
       keyboard = buildGetSongKeyboard(jobId);
+
+      // Store song info in cache for callback handler
+      jobData.songTitle = song.title;
+      jobData.songArtist = song.artist;
     } catch (musicErr) {
       if (musicErr instanceof MusicNotFoundError) {
         logger.info('No music recognized for reel', { shortcode });
-        captionText = '🎵 Musiqa aniqlanmadi.';
       } else {
         logger.error('Music recognition failed for reel', musicErr);
-        captionText = '🎵 Musiqa aniqlanmadi.';
       }
+      captionText = '🎵 Musiqa aniqlanmadi.';
     }
+
+    await saveReelJob(jobData);
 
     // 5. Send ONE video message with caption and inline keyboard
     const videoSent = await sendReelVideoToTelegram(
@@ -259,7 +311,9 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
 }
 
 /**
- * Handles callback queries (e.g. "get_song:<jobId>")
+ * Handles callback queries.
+ *
+ * "get_song:<jobId>" — Fetches the actual audio file and sends it to the user as a Telegram audio message.
  */
 export async function handleCallbackQuery(ctx: Context): Promise<void> {
   const callbackData = ctx.callbackQuery?.data;
@@ -275,10 +329,40 @@ export async function handleCallbackQuery(ctx: Context): Promise<void> {
   }
 
   if (callbackData.startsWith('get_song:')) {
-    await ctx.answerCallbackQuery({
-      text: '🎧 Qo‘shiqni yuklab olish funksiyasi tez orada ishga tushadi!',
-      show_alert: true,
-    });
+    const jobId = callbackData.split(':')[1];
+    await ctx.answerCallbackQuery();
+
+    const chatId = ctx.callbackQuery?.message?.chat?.id;
+    if (!chatId) return;
+
+    try {
+      const job = await getReelJob(jobId);
+
+      if (!job || !job.songTitle || !job.songArtist) {
+        await ctx.api.sendMessage(chatId, '⚠️ Qo‘shiq maʼlumotlari topilmadi. Reel linkini qayta yuboring.');
+        return;
+      }
+
+      await ctx.api.sendMessage(chatId, '⏳ Qo‘shiq yuklanmoqda...');
+
+      const audio = await getSongAudio(job.songTitle, job.songArtist);
+
+      await ctx.api.sendAudio(chatId, new InputFile(audio.buffer, `${audio.title}.mp3`), {
+        title: audio.title,
+        performer: audio.artist,
+        duration: audio.durationSeconds,
+      });
+
+      logger.info('Audio file sent to Telegram', { jobId, title: audio.title, artist: audio.artist });
+    } catch (error: unknown) {
+      logger.error('Failed to send audio for get_song callback', error);
+
+      let userMsg = '⚠️ Qo‘shiqni yuklab bo‘lmadi. Keyinroq qayta urinib ko‘ring.';
+      if (error instanceof AudioSourceError) {
+        userMsg = '⚠️ Qo‘shiq topilmadi. Keyinroq qayta urinib ko‘ring.';
+      }
+      await ctx.api.sendMessage(chatId, userMsg).catch(() => {});
+    }
     return;
   }
 
@@ -288,5 +372,3 @@ export async function handleCallbackQuery(ctx: Context): Promise<void> {
 function escapeMarkdown(text: string): string {
   return text.replace(/[_*`\[\]]/g, '\\$&');
 }
-
-

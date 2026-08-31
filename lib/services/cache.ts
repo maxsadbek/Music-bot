@@ -8,6 +8,8 @@ export interface ReelJobData {
   mediaUrl: string;
   shortcode: string;
   createdAt: number;
+  songTitle?: string;
+  songArtist?: string;
 }
 
 class MemoryStore {
