@@ -15,9 +15,10 @@ export const maxDuration = 60;
 export async function POST(req: Request): Promise<Response> {
   try {
     // 1. Validate Secret Token if TELEGRAM_WEBHOOK_SECRET environment variable is set
-    const expectedSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+    //    .trim() guards against accidental whitespace/newlines in the env var.
+    const expectedSecret = process.env.TELEGRAM_WEBHOOK_SECRET?.trim();
     const secretConfigured = Boolean(expectedSecret && expectedSecret.length > 0);
-    const receivedSecret = req.headers.get('x-telegram-bot-api-secret-token');
+    const receivedSecret = req.headers.get('x-telegram-bot-api-secret-token')?.trim();
     const secretHeaderPresent = Boolean(receivedSecret && receivedSecret.length > 0);
 
     logger.info(
@@ -26,17 +27,28 @@ export async function POST(req: Request): Promise<Response> {
 
     if (secretConfigured) {
       if (!secretHeaderPresent) {
-        logger.warn('[Webhook] Request missing X-Telegram-Bot-Api-Secret-Token header');
+        logger.warn(
+          '[Webhook] Request missing X-Telegram-Bot-Api-Secret-Token header. '
+          + 'Telegram may not have been registered with a secret_token. '
+          + 'Re-register via: GET /api/telegram/webhook?action=setup',
+        );
         return new Response('Unauthorized', { status: 401 });
       }
       if (receivedSecret !== expectedSecret) {
         logger.warn(
-          '[Webhook] Secret mismatch — TELEGRAM_WEBHOOK_SECRET env var does not match ' +
-            'the secret_token registered with Telegram. ' +
-            'Re-register the webhook via POST /api/telegram/webhook/setup',
+          '[Webhook] Secret mismatch — TELEGRAM_WEBHOOK_SECRET env var value '
+          + '(length ' + (expectedSecret?.length ?? 0) + ') does not match '
+          + 'the secret_token Telegram is sending (length ' + (receivedSecret?.length ?? 0) + '). '
+          + 'Re-register via: GET /api/telegram/webhook?action=setup',
         );
         return new Response('Unauthorized', { status: 401 });
       }
+      logger.info('[Webhook] Secret validation passed');
+    } else {
+      logger.warn(
+        '[Webhook] TELEGRAM_WEBHOOK_SECRET is not set — webhook is running WITHOUT secret validation. '
+        + 'This is insecure. Set the env var and re-register.',
+      );
     }
 
     // 2. Obtain Bot instance & handle webhook update
@@ -82,7 +94,8 @@ export async function GET(req: Request): Promise<Response> {
   if (action === 'setup') {
     try {
       const botToken = process.env.TELEGRAM_BOT_TOKEN;
-      const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+      // .trim() matches the validation in POST handler
+      const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET?.trim();
 
       if (!botToken) {
         return new Response(
