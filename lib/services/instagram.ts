@@ -16,6 +16,167 @@ export interface InstagramReelMedia {
 }
 
 /**
+ * Checks whether a given URL string is an Instagram page URL (post, reel, etc.),
+ * rather than a direct downloadable media asset URL.
+ */
+export function isInstagramPageUrl(urlStr: string): boolean {
+  if (!urlStr || typeof urlStr !== 'string') return false;
+  try {
+    const parsed = new URL(urlStr);
+    const hostname = parsed.hostname.toLowerCase();
+    if (hostname === 'instagram.com' || hostname.endsWith('.instagram.com')) {
+      const pathname = parsed.pathname.toLowerCase();
+      if (
+        pathname.startsWith('/reel/') ||
+        pathname.startsWith('/reels/') ||
+        pathname.startsWith('/p/') ||
+        pathname.startsWith('/tv/') ||
+        pathname.startsWith('/share/') ||
+        pathname.startsWith('/stories/') ||
+        pathname === '/'
+      ) {
+        return true;
+      }
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Validates that a candidate URL string is a valid HTTP(S) URL and NOT an Instagram page URL.
+ */
+export function isValidMediaUrl(urlStr: unknown): urlStr is string {
+  if (!urlStr || typeof urlStr !== 'string') return false;
+  const trimmed = urlStr.trim();
+  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) return false;
+  if (isInstagramPageUrl(trimmed)) return false;
+  return true;
+}
+
+/**
+ * Recursively redacts sensitive fields (access keys, tokens, secrets) for safe logging.
+ */
+export function sanitizeForLog(obj: unknown): unknown {
+  if (obj === null || obj === undefined) return obj;
+  if (typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) return obj.map(sanitizeForLog);
+
+  const sanitized: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+    const lowerKey = key.toLowerCase();
+    if (
+      lowerKey.includes('key') ||
+      lowerKey.includes('token') ||
+      lowerKey.includes('secret') ||
+      lowerKey.includes('auth') ||
+      lowerKey.includes('password')
+    ) {
+      sanitized[key] = '[REDACTED]';
+    } else {
+      sanitized[key] = sanitizeForLog(value);
+    }
+  }
+  return sanitized;
+}
+
+/**
+ * Extracts valid direct media candidate URLs from SocialKit response structure.
+ */
+function extractMediaUrls(responseBody: any): { videoUrl?: string; audioUrl?: string } {
+  let videoUrl: string | undefined;
+  let audioUrl: string | undefined;
+
+  const payloads = [
+    responseBody?.data,
+    responseBody?.result,
+    responseBody?.payload,
+    responseBody,
+  ].filter(Boolean);
+
+  for (const payload of payloads) {
+    // 1. Check audio candidate fields
+    if (!audioUrl) {
+      const audioFields = [
+        payload.audio_url,
+        payload.audioUrl,
+        payload.music_url,
+        payload.musicUrl,
+        payload.audio,
+        payload.mp3_url,
+        payload.mp3,
+      ];
+      for (const cand of audioFields) {
+        if (isValidMediaUrl(cand)) {
+          audioUrl = cand;
+          break;
+        }
+      }
+    }
+
+    // 2. Check video / direct media candidate fields
+    if (!videoUrl) {
+      const videoFields = [
+        payload.video_url,
+        payload.videoUrl,
+        payload.download_url,
+        payload.downloadUrl,
+        payload.direct_url,
+        payload.directUrl,
+        payload.media_url,
+        payload.mediaUrl,
+        payload.video,
+        payload.src,
+        payload.link,
+      ];
+      for (const cand of videoFields) {
+        if (isValidMediaUrl(cand)) {
+          videoUrl = cand;
+          break;
+        }
+      }
+    }
+
+    // 3. Check array candidate fields (urls, medias, videos, links)
+    const arrayCandidates = [
+      payload.urls,
+      payload.medias,
+      payload.videos,
+      payload.links,
+      Array.isArray(payload) ? payload : null,
+    ].filter(Array.isArray);
+
+    for (const arr of arrayCandidates) {
+      for (const item of arr) {
+        if (typeof item === 'string' && isValidMediaUrl(item)) {
+          if (!videoUrl) videoUrl = item;
+        } else if (item && typeof item === 'object') {
+          const itemAudio =
+            item.audio_url || item.audioUrl || item.music_url || item.audio || item.mp3;
+          const itemVideo =
+            item.video_url || item.videoUrl || item.download_url || item.media_url || item.url || item.link;
+
+          if (!audioUrl && isValidMediaUrl(itemAudio)) {
+            audioUrl = itemAudio;
+          }
+          if (!videoUrl && isValidMediaUrl(itemVideo)) {
+            videoUrl = itemVideo;
+          }
+        }
+      }
+    }
+
+    // 4. Fallback to generic 'url' field ONLY if it is a valid direct media URL (not an Instagram page URL!)
+    if (!videoUrl && isValidMediaUrl(payload.url)) {
+      videoUrl = payload.url;
+    }
+  }
+
+  return { videoUrl, audioUrl };
+}
+
+/**
  * Service abstraction for retrieving Instagram Reel video and media URLs.
  * Separated cleanly so provider implementations can be swapped without touching bot logic.
  */
@@ -52,6 +213,9 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
       throw new InstagramApiError('Empty response from SocialKit Instagram service.');
     }
 
+    // Log SocialKit response structure safely without logging API keys
+    logger.info('SocialKit response received', { response: sanitizeForLog(data) });
+
     if (data.success === false || data.status === 'error') {
       const msg = data.message || data.error || 'SocialKit API returned failure status';
       logger.error('SocialKit API error response:', msg);
@@ -67,27 +231,9 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
       throw new InstagramApiError(`SocialKit API error: ${msg}`);
     }
 
+    const { videoUrl, audioUrl } = extractMediaUrls(data);
+
     const payload = data.data || data.result || data;
-
-    const videoUrl =
-      payload.video_url ||
-      payload.media_url ||
-      payload.url ||
-      payload.download_url ||
-      (Array.isArray(payload.urls) && (payload.urls[0]?.url || payload.urls[0])) ||
-      (Array.isArray(payload) && (payload[0]?.video_url || payload[0]?.url || payload[0]?.media_url)) ||
-      data.video_url ||
-      data.media_url ||
-      data.url ||
-      data.download_url;
-
-    const audioUrl =
-      payload.audio_url ||
-      payload.music_url ||
-      payload.audio ||
-      data.audio_url ||
-      data.music_url ||
-      data.audio;
 
     const thumbnailUrl =
       payload.thumbnail_url ||
@@ -106,9 +252,9 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
     const finalMediaUrl = videoUrl || audioUrl;
 
     if (!finalMediaUrl) {
-      if (process.env.DEBUG_INSTAGRAM_API === 'true') {
-        logger.error('Failed to extract media URL from SocialKit API response. Raw response:', JSON.stringify(data));
-      }
+      logger.error('Failed to extract direct media URL from SocialKit API response.', {
+        response: sanitizeForLog(data),
+      });
 
       const rawMsg = data.message || data.error || '';
       const msgLower = String(rawMsg).toLowerCase();
@@ -119,10 +265,10 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
       ) {
         throw new PrivateOrDeletedReelError();
       }
-      throw new InstagramApiError('Could not find downloadable media URL in SocialKit response.');
+      throw new InstagramApiError('Could not find downloadable direct media URL in SocialKit response.');
     }
 
-    logger.info('Instagram media URL received', { shortcode, mediaUrl: finalMediaUrl });
+    logger.info('Instagram direct media URL received', { shortcode, mediaUrl: finalMediaUrl });
 
     return {
       id: shortcode,
@@ -158,3 +304,4 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
     throw new InstagramApiError('Failed to retrieve Instagram Reel media.');
   }
 }
+

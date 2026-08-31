@@ -87,4 +87,34 @@ describe('SocialKit Instagram Service', () => {
       getInstagramReel('https://www.instagram.com/reel/DRU4smMj0cu/')
     ).rejects.toThrow(InstagramApiError);
   });
+
+  it('should reject Instagram Reel page URL returned in response and throw InstagramApiError when no direct media URL exists', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          url: 'https://www.instagram.com/reel/DZ0F3osxnh2/',
+        },
+      },
+    });
+
+    await expect(
+      getInstagramReel('https://www.instagram.com/reel/DZ0F3osxnh2/')
+    ).rejects.toThrow(InstagramApiError);
+  });
+
+  it('should extract direct media URL when download_url is provided alongside Instagram page URL', async () => {
+    mockedAxios.post.mockResolvedValueOnce({
+      data: {
+        success: true,
+        data: {
+          url: 'https://www.instagram.com/reel/DZ0F3osxnh2/',
+          download_url: 'https://cdn.socialkit.dev/direct-video.mp4',
+        },
+      },
+    });
+
+    const result = await getInstagramReel('https://www.instagram.com/reel/DZ0F3osxnh2/');
+    expect(result.mediaUrl).toBe('https://cdn.socialkit.dev/direct-video.mp4');
+  });
 });

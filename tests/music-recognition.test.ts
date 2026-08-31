@@ -87,4 +87,26 @@ describe('ACRCloud Music Recognition Service', () => {
       identifySong('https://cdn.example.com/audio.mp3')
     ).rejects.toThrow(MusicNotFoundError);
   });
+
+  it('should throw MusicRecognitionApiError when media URL returns text/html content-type', async () => {
+    mockedAxios.get.mockResolvedValueOnce({
+      data: Buffer.from('<!DOCTYPE html><html><body>Page</body></html>'),
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    });
+
+    await expect(
+      identifySong('https://www.instagram.com/reel/DZ0F3osxnh2/')
+    ).rejects.toThrow(MusicRecognitionApiError);
+  });
+
+  it('should throw MusicRecognitionApiError when media URL returns HTML body bytes despite non-HTML header', async () => {
+    mockedAxios.get.mockResolvedValueOnce({
+      data: Buffer.from('<!DOCTYPE html><html><head><title>Instagram</title></head></html>'),
+      headers: { 'content-type': 'application/octet-stream' },
+    });
+
+    await expect(
+      identifySong('https://cdn.example.com/page.html')
+    ).rejects.toThrow(MusicRecognitionApiError);
+  });
 });

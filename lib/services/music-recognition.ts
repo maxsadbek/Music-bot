@@ -70,9 +70,27 @@ export async function identifySong(audioOrVideoUrl: string): Promise<SongResult>
       },
     });
 
+    const contentType = String(response.headers?.['content-type'] || '').toLowerCase();
+    if (contentType.includes('text/html') || contentType.includes('application/xhtml')) {
+      logger.error('Fetched URL returned HTML Content-Type instead of media', { contentType, mediaUrl: audioOrVideoUrl });
+      throw new MusicRecognitionApiError('Fetched media URL returned HTML instead of audio/video media.');
+    }
+
     const fullBuffer = Buffer.from(response.data);
     if (!fullBuffer || fullBuffer.length === 0) {
       throw new MusicRecognitionApiError('Downloaded audio/media file is empty.');
+    }
+
+    const headText = fullBuffer.subarray(0, 200).toString('utf-8').trim().toLowerCase();
+    if (
+      headText.startsWith('<!doctype') ||
+      headText.startsWith('<html') ||
+      headText.startsWith('<head') ||
+      headText.includes('<html') ||
+      headText.includes('<!doctype html')
+    ) {
+      logger.error('Downloaded content contains HTML page structure', { mediaUrl: audioOrVideoUrl, snippet: headText.slice(0, 100) });
+      throw new MusicRecognitionApiError('Downloaded content is an HTML page, not audio/video media bytes.');
     }
 
     // Limit sample buffer size to 3MB for fast serverless execution
@@ -80,7 +98,9 @@ export async function identifySong(audioOrVideoUrl: string): Promise<SongResult>
       ? fullBuffer.subarray(0, 3 * 1024 * 1024)
       : fullBuffer;
   } catch (error: unknown) {
-    if (error instanceof MusicRecognitionApiError) throw error;
+    if (error instanceof MusicNotFoundError || error instanceof MusicRecognitionApiError) {
+      throw error;
+    }
     logger.error('Failed to download audio/media buffer from URL', error);
     throw new MusicRecognitionApiError('Failed to fetch audio/media content for music recognition.');
   }
