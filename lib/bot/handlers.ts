@@ -218,28 +218,41 @@ export async function handleAbout(ctx: Context): Promise<void> {
  * 5. Send video with caption + inline button
  */
 export async function handleTextMessage(ctx: Context): Promise<void> {
+  logger.info('[IG DEBUG] handleTextMessage called');
+  
   const userId = ctx.from?.id;
   if (userId && !(await checkRateLimit(userId))) {
+    logger.info('[IG DEBUG] Rate limit exceeded for user:', userId);
     await ctx.reply(formatErrorMessage(new RateLimitError()));
     return;
   }
 
   const text = ctx.message?.text;
-  if (!text) return;
+  if (!text) {
+    logger.info('[IG DEBUG] No text in message');
+    return;
+  }
+  
+  logger.info('[IG DEBUG] Message text received, length:', text.length);
 
   const urlInText = extractInstagramUrlFromText(text);
+  logger.info('[IG DEBUG] URL extraction result:', urlInText || 'none');
 
   if (!urlInText) {
+    logger.info('[IG DEBUG] No Instagram URL found in text');
     await ctx.reply('❌ Bu Instagram Reel linki emas.');
     return;
   }
 
   let statusMsg;
   try {
+    logger.info('[IG DEBUG] Calling validateAndNormalizeInstagramUrl');
     const { normalizedUrl, shortcode } = validateAndNormalizeInstagramUrl(urlInText);
+    logger.info('[IG DEBUG] Validation successful, shortcode:', shortcode);
     const overallStart = Date.now();
 
     // Duplicate request protection: check if we recently processed this shortcode
+    logger.info('[IG DEBUG] Checking cache for shortcode:', shortcode);
     const existingJob = await getCachedJobByShortcode(shortcode);
     if (existingJob && existingJob.songTitle && existingJob.songArtist) {
       logger.info('Reusing existing recognition for shortcode', { shortcode, jobId: existingJob.jobId });
@@ -266,13 +279,17 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       });
       return;
     }
+    logger.info('[IG DEBUG] No cached job found, proceeding with fresh request');
 
     // Send initial status message
     statusMsg = await ctx.reply('🎬 Reel qabul qilindi\n⏳ Video olinmoqda...');
+    logger.info('[IG DEBUG] Status message sent');
 
     // 1. Fetch direct video media URL from SocialKit
+    logger.info('[IG DEBUG] Calling getInstagramReel with normalized URL:', normalizedUrl);
     const instagramStart = Date.now();
     const reelMedia = await getInstagramReel(normalizedUrl);
+    logger.info('[IG DEBUG] getInstagramReel succeeded');
     logger.info('[PERF] Instagram', { duration: `${Date.now() - instagramStart}ms` });
 
     // 2. Pre-download media buffer once to reuse for both Telegram upload fallback and ACRCloud recognition
@@ -357,18 +374,25 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
 
     logger.info('[PERF] Total request', { duration: `${Date.now() - overallStart}ms`, jobId });
   } catch (error: unknown) {
+    logger.error('[IG DEBUG] ERROR in handleTextMessage');
+    logger.error('[IG DEBUG] ERROR name:', error instanceof Error ? error.constructor.name : 'Unknown');
+    logger.error('[IG DEBUG] ERROR message:', error instanceof Error ? error.message : String(error));
     logger.error('Error handling Instagram Reel URL', error);
     const userError = formatErrorMessage(error);
+    logger.info('[IG DEBUG] User error message:', userError);
 
     if (statusMsg) {
+      logger.info('[IG DEBUG] Editing status message with error');
       await ctx.api.editMessageText(
         ctx.chat!.id,
         statusMsg.message_id,
         userError
       ).catch(() => {
+        logger.info('[IG DEBUG] Status message edit failed, sending new message');
         ctx.reply(userError);
       });
     } else {
+      logger.info('[IG DEBUG] No status message, sending new error message');
       await ctx.reply(userError);
     }
   }

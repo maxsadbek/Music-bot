@@ -4,7 +4,7 @@ import { getInstagramReel } from '../lib/services/instagram';
 import { InstagramApiError, PrivateOrDeletedReelError } from '../lib/utils/errors';
 
 vi.mock('axios');
-const mockedAxios = vi.mocked(axios, true);
+const mockedAxios = axios as any;
 
 describe('SocialKit Instagram Service', () => {
   const originalEnv = process.env;
@@ -28,15 +28,12 @@ describe('SocialKit Instagram Service', () => {
     ).rejects.toThrow(InstagramApiError);
   });
 
-  it('should send POST request with access_key, url, format in body and Content-Type header', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+  it('should send GET request with url and shortcode query params and multiple API key headers', async () => {
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: true,
-        data: {
-          url: 'https://cdn.socialkit.dev/video.mp4',
-          audio_url: 'https://cdn.socialkit.dev/audio.mp3',
-          title: 'Sample Reel',
-        },
+        video_url: 'https://cdn.socialkit.dev/video.mp4',
+        audio_url: 'https://cdn.socialkit.dev/audio.mp3',
+        title: 'Sample Reel',
       },
       status: 200,
       headers: {
@@ -46,17 +43,20 @@ describe('SocialKit Instagram Service', () => {
 
     const result = await getInstagramReel('https://www.instagram.com/reel/DRU4smMj0cu/');
 
-    expect(mockedAxios.post).toHaveBeenCalledWith(
+    expect(mockedAxios.get).toHaveBeenCalledWith(
       'https://api.socialkit.dev/instagram/download',
       {
-        access_key: 'test_socialkit_key',
-        url: 'https://www.instagram.com/reel/DRU4smMj0cu/',
-      },
-      {
+        params: {
+          url: 'https://www.instagram.com/reel/DRU4smMj0cu/',
+          shortcode: 'DRU4smMj0cu',
+        },
         headers: {
           'Content-Type': 'application/json',
+          'X-RapidAPI-Key': 'test_socialkit_key',
+          'x-api-key': 'test_socialkit_key',
+          'Authorization': 'Bearer test_socialkit_key',
         },
-        timeout: 15000,
+        timeout: 12000,
       }
     );
 
@@ -66,9 +66,8 @@ describe('SocialKit Instagram Service', () => {
   });
 
   it('should throw PrivateOrDeletedReelError when SocialKit returns explicit private account error', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: false,
         message: 'This account is private',
       },
       status: 200,
@@ -82,10 +81,9 @@ describe('SocialKit Instagram Service', () => {
     ).rejects.toThrow(PrivateOrDeletedReelError);
   });
 
-  it('should throw InstagramApiError when SocialKit returns success: false error without explicit private/deleted message', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+  it('should throw InstagramApiError when SocialKit returns error without explicit private/deleted message', async () => {
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: false,
         message: 'Access key is missing',
       },
       status: 200,
@@ -100,9 +98,8 @@ describe('SocialKit Instagram Service', () => {
   });
 
   it('should throw InstagramApiError (not PrivateOrDeletedReelError) for generic "not found" without reel context', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: false,
         message: 'Resource not found',
       },
       status: 200,
@@ -121,12 +118,9 @@ describe('SocialKit Instagram Service', () => {
   });
 
   it('should reject Instagram Reel page URL returned in response and throw InstagramApiError when no direct media URL exists', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: true,
-        data: {
-          url: 'https://www.instagram.com/reel/DZ0F3osxnh2/',
-        },
+        url: 'https://www.instagram.com/reel/DZ0F3osxnh2/',
       },
       status: 200,
       headers: {
@@ -140,13 +134,10 @@ describe('SocialKit Instagram Service', () => {
   });
 
   it('should extract direct media URL when download_url is provided alongside Instagram page URL', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: true,
-        data: {
-          url: 'https://www.instagram.com/reel/DZ0F3osxnh2/',
-          download_url: 'https://cdn.socialkit.dev/direct-video.mp4',
-        },
+        url: 'https://www.instagram.com/reel/DZ0F3osxnh2/',
+        download_url: 'https://cdn.socialkit.dev/direct-video.mp4',
       },
       status: 200,
       headers: {
@@ -159,12 +150,9 @@ describe('SocialKit Instagram Service', () => {
   });
 
   it('should extract media URL from video_url field', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: true,
-        data: {
-          video_url: 'https://cdn.socialkit.dev/video.mp4',
-        },
+        video_url: 'https://cdn.socialkit.dev/video.mp4',
       },
       status: 200,
       headers: {
@@ -177,16 +165,13 @@ describe('SocialKit Instagram Service', () => {
   });
 
   it('should extract media URL from nested media structure', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: true,
-        data: {
-          medias: [
-            {
-              url: 'https://cdn.socialkit.dev/nested-video.mp4',
-            },
-          ],
-        },
+        urls: [
+          {
+            url: 'https://cdn.socialkit.dev/nested-video.mp4',
+          },
+        ],
       },
       status: 200,
       headers: {
@@ -199,13 +184,10 @@ describe('SocialKit Instagram Service', () => {
   });
 
   it('should throw InstagramApiError (not PrivateOrDeletedReelError) when media URL is missing without explicit private/deleted message', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: true,
-        data: {
-          title: 'Sample Reel',
-          thumbnail: 'https://cdn.socialkit.dev/thumb.jpg',
-        },
+        title: 'Sample Reel',
+        thumbnail: 'https://cdn.socialkit.dev/thumb.jpg',
       },
       status: 200,
       headers: {
@@ -223,9 +205,8 @@ describe('SocialKit Instagram Service', () => {
   });
 
   it('should throw PrivateOrDeletedReelError for explicit deleted reel message', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: false,
         message: 'This reel has been deleted',
       },
       status: 200,
@@ -240,9 +221,8 @@ describe('SocialKit Instagram Service', () => {
   });
 
   it('should throw PrivateOrDeletedReelError for explicit not found reel message', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: false,
         message: 'Reel not found',
       },
       status: 200,
@@ -257,12 +237,9 @@ describe('SocialKit Instagram Service', () => {
   });
 
   it('should throw InstagramApiError (not PrivateOrDeletedReelError) for generic "not found" message without reel context', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: true,
-        data: {
-          message: 'Generic error occurred',
-        },
+        message: 'Generic error occurred',
       },
       status: 200,
       headers: {
@@ -280,12 +257,9 @@ describe('SocialKit Instagram Service', () => {
   });
 
   it('should handle Instagram Reel URL with query parameters', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: true,
-        data: {
-          video_url: 'https://cdn.socialkit.dev/video.mp4',
-        },
+        video_url: 'https://cdn.socialkit.dev/video.mp4',
       },
       status: 200,
       headers: {
@@ -299,11 +273,8 @@ describe('SocialKit Instagram Service', () => {
   });
 
   it('should throw InstagramApiError for malformed provider response', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
-      data: {
-        success: true,
-        data: null,
-      },
+    mockedAxios.get.mockResolvedValueOnce({
+      data: null,
       status: 200,
       headers: {
         'content-type': 'application/json',
@@ -316,12 +287,9 @@ describe('SocialKit Instagram Service', () => {
   });
 
   it('should extract media URL from file_url field', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: true,
-        data: {
-          file_url: 'https://cdn.socialkit.dev/file-video.mp4',
-        },
+        file_url: 'https://cdn.socialkit.dev/file-video.mp4',
       },
       status: 200,
       headers: {
@@ -334,12 +302,9 @@ describe('SocialKit Instagram Service', () => {
   });
 
   it('should extract media URL from content_url field', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: true,
-        data: {
-          content_url: 'https://cdn.socialkit.dev/content-video.mp4',
-        },
+        content_url: 'https://cdn.socialkit.dev/content-video.mp4',
       },
       status: 200,
       headers: {
@@ -353,9 +318,8 @@ describe('SocialKit Instagram Service', () => {
 
   // Test 1: direct video_url
   it('should extract media URL from direct video_url field at root level', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: true,
         video_url: 'https://cdn.socialkit.dev/direct-video.mp4',
       },
       status: 200,
@@ -369,11 +333,10 @@ describe('SocialKit Instagram Service', () => {
   });
 
   // Test 2: nested data.video_url
-  it('should extract media URL from nested data.video_url', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+  it('should extract media URL from nested result.video_url', async () => {
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: true,
-        data: {
+        result: {
           video_url: 'https://cdn.socialkit.dev/nested-data-video.mp4',
         },
       },
@@ -389,9 +352,8 @@ describe('SocialKit Instagram Service', () => {
 
   // Test 3: nested result.download_url
   it('should extract media URL from nested result.download_url', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: true,
         result: {
           download_url: 'https://cdn.socialkit.dev/result-download.mp4',
         },
@@ -408,16 +370,13 @@ describe('SocialKit Instagram Service', () => {
 
   // Test 4: array-based media response
   it('should extract media URL from array-based media response', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: true,
-        data: {
-          videos: [
-            {
-              url: 'https://cdn.socialkit.dev/array-video.mp4',
-            },
-          ],
-        },
+        urls: [
+          {
+            url: 'https://cdn.socialkit.dev/array-video.mp4',
+          },
+        ],
       },
       status: 200,
       headers: {
@@ -431,12 +390,9 @@ describe('SocialKit Instagram Service', () => {
 
   // Test 5: Instagram page URL rejection
   it('should reject Instagram page URL and throw InstagramApiError when no valid alternative exists', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: true,
-        data: {
-          url: 'https://www.instagram.com/reel/REJECT123/',
-        },
+        url: 'https://www.instagram.com/reel/REJECT123/',
       },
       status: 200,
       headers: {
@@ -451,12 +407,9 @@ describe('SocialKit Instagram Service', () => {
 
   // Test 6: valid CDN URL without .mp4 extension
   it('should accept valid CDN URL without .mp4 extension', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: true,
-        data: {
-          video_url: 'https://cdn.instagram.com/v/t123.45678/video_cdn/1234567890_1234567890.mp4?_nc_ht=cdn.instagram.com&_nc_cat=1',
-        },
+        video_url: 'https://cdn.instagram.com/v/t123.45678/video_cdn/1234567890_1234567890.mp4?_nc_ht=cdn.instagram.com&_nc_cat=1',
       },
       status: 200,
       headers: {
@@ -470,9 +423,8 @@ describe('SocialKit Instagram Service', () => {
 
   // Test 7: explicit private response
   it('should throw PrivateOrDeletedReelError for explicit private account response', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: false,
         message: 'This account is private',
       },
       status: 200,
@@ -488,9 +440,8 @@ describe('SocialKit Instagram Service', () => {
 
   // Test 8: explicit deleted response
   it('should throw PrivateOrDeletedReelError for explicit deleted reel response', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: false,
         message: 'This reel has been deleted',
       },
       status: 200,
@@ -506,13 +457,10 @@ describe('SocialKit Instagram Service', () => {
 
   // Test 9: HTTP 200 with unexpected response structure
   it('should throw InstagramApiError for HTTP 200 with unexpected response structure', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: true,
-        data: {
-          unexpected_field: 'some_value',
-          another_field: 123,
-        },
+        unexpected_field: 'some_value',
+        another_field: 123,
       },
       status: 200,
       headers: {
@@ -527,7 +475,7 @@ describe('SocialKit Instagram Service', () => {
 
   // Test 10: HTTP error from SocialKit
   it('should throw InstagramApiError for HTTP error from SocialKit', async () => {
-    mockedAxios.post.mockRejectedValueOnce({
+    mockedAxios.get.mockRejectedValueOnce({
       response: {
         status: 500,
         data: {
@@ -543,9 +491,8 @@ describe('SocialKit Instagram Service', () => {
 
   // Test 11: nested result.download object with url field
   it('should extract media URL from nested result.download.url structure', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: true,
         result: {
           download: {
             url: 'https://cdn.socialkit.dev/result-download-nested.mp4',
@@ -564,13 +511,10 @@ describe('SocialKit Instagram Service', () => {
 
   // Test 12: multiple media candidates with priority
   it('should prefer video URL over download URL when both exist', async () => {
-    mockedAxios.post.mockResolvedValueOnce({
+    mockedAxios.get.mockResolvedValueOnce({
       data: {
-        success: true,
-        data: {
-          video_url: 'https://cdn.socialkit.dev/priority-video.mp4',
-          download_url: 'https://cdn.socialkit.dev/priority-download.mp4',
-        },
+        video_url: 'https://cdn.socialkit.dev/priority-video.mp4',
+        download_url: 'https://cdn.socialkit.dev/priority-download.mp4',
       },
       status: 200,
       headers: {

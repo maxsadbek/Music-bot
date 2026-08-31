@@ -82,409 +82,182 @@ export function sanitizeForLog(obj: unknown): unknown {
 }
 
 /**
- * Extracts valid direct media candidate URLs from SocialKit response structure.
- */
-function extractMediaUrls(responseBody: any): { videoUrl?: string; audioUrl?: string } {
-  let videoUrl: string | undefined;
-  let audioUrl: string | undefined;
-
-  const payloads = [
-    responseBody?.data,
-    responseBody?.result,
-    responseBody?.payload,
-    responseBody,
-  ].filter(Boolean);
-
-  for (const payload of payloads) {
-    // 1. Check audio candidate fields
-    if (!audioUrl) {
-      const audioFields = [
-        { field: 'audio_url', value: payload.audio_url },
-        { field: 'audioUrl', value: payload.audioUrl },
-        { field: 'music_url', value: payload.music_url },
-        { field: 'musicUrl', value: payload.musicUrl },
-        { field: 'audio', value: payload.audio },
-        { field: 'mp3_url', value: payload.mp3_url },
-        { field: 'mp3', value: payload.mp3 },
-      ];
-      for (const { field, value } of audioFields) {
-        if (value) {
-          logger.info(`[Instagram] candidate found: ${field} = ${value}`);
-          if (isValidMediaUrl(value)) {
-            audioUrl = value;
-            logger.info(`[Instagram] selected: ${field}`);
-            break;
-          } else {
-            logger.info(`[Instagram] rejected: ${field} (invalid media URL)`);
-          }
-        }
-      }
-    }
-
-    // 2. Check video / direct media candidate fields
-    if (!videoUrl) {
-      const videoFields = [
-        { field: 'video_url', value: payload.video_url },
-        { field: 'videoUrl', value: payload.videoUrl },
-        { field: 'download_url', value: payload.download_url },
-        { field: 'downloadUrl', value: payload.downloadUrl },
-        { field: 'direct_url', value: payload.direct_url },
-        { field: 'directUrl', value: payload.directUrl },
-        { field: 'media_url', value: payload.media_url },
-        { field: 'mediaUrl', value: payload.mediaUrl },
-        { field: 'video', value: payload.video },
-        { field: 'src', value: payload.src },
-        { field: 'link', value: payload.link },
-        { field: 'url', value: payload.url },
-        { field: 'file', value: payload.file },
-        { field: 'file_url', value: payload.file_url },
-        { field: 'fileUrl', value: payload.fileUrl },
-        { field: 'content', value: payload.content },
-        { field: 'content_url', value: payload.content_url },
-        { field: 'contentUrl', value: payload.contentUrl },
-      ];
-      for (const { field, value } of videoFields) {
-        if (value) {
-          logger.info(`[Instagram] candidate found: ${field} = ${value}`);
-          if (isValidMediaUrl(value)) {
-            videoUrl = value;
-            logger.info(`[Instagram] selected: ${field}`);
-            break;
-          } else {
-            if (isInstagramPageUrl(value)) {
-              logger.info(`[Instagram] rejected: ${field} (URL is Instagram page)`);
-            } else {
-              logger.info(`[Instagram] rejected: ${field} (invalid media URL)`);
-            }
-          }
-        }
-      }
-    }
-
-    // 3. Check deeply nested structures like result.download.url, data.media.url, etc.
-    if (!videoUrl || !audioUrl) {
-      const nestedContainers = [
-        'download',
-        'media',
-        'video',
-        'item',
-        'response',
-      ];
-      
-      for (const container of nestedContainers) {
-        if (payload[container] && typeof payload[container] === 'object') {
-          const nested = payload[container];
-          logger.info(`[Instagram] checking nested container: ${container}`);
-          
-          // Check for common URL fields in nested object
-          const nestedFields = [
-            { field: `${container}.url`, value: nested.url },
-            { field: `${container}.video_url`, value: nested.video_url },
-            { field: `${container}.download_url`, value: nested.download_url },
-            { field: `${container}.media_url`, value: nested.media_url },
-            { field: `${container}.link`, value: nested.link },
-          ];
-          
-          for (const { field, value } of nestedFields) {
-            if (value) {
-              logger.info(`[Instagram] candidate found: ${field} = ${value}`);
-              if (!audioUrl && (field.includes('audio') || field.includes('music') || field.includes('mp3'))) {
-                if (isValidMediaUrl(value)) {
-                  audioUrl = value;
-                  logger.info(`[Instagram] selected: ${field}`);
-                }
-              } else if (!videoUrl && isValidMediaUrl(value)) {
-                videoUrl = value;
-                logger.info(`[Instagram] selected: ${field}`);
-                break;
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // 4. Check array candidate fields (urls, medias, videos, links)
-    const arrayCandidates = [
-      { field: 'urls', value: payload.urls },
-      { field: 'medias', value: payload.medias },
-      { field: 'videos', value: payload.videos },
-      { field: 'links', value: payload.links },
-      { field: 'root array', value: Array.isArray(payload) ? payload : null },
-    ].filter(item => Array.isArray(item.value));
-
-    for (const { field, value: arr } of arrayCandidates) {
-      logger.info(`[Instagram] checking array field: ${field} (${arr.length} items)`);
-      for (let i = 0; i < arr.length; i++) {
-        const item = arr[i];
-        if (typeof item === 'string') {
-          logger.info(`[Instagram] candidate found: ${field}[${i}] = ${item}`);
-          if (isValidMediaUrl(item)) {
-            if (!videoUrl) {
-              videoUrl = item;
-              logger.info(`[Instagram] selected: ${field}[${i}]`);
-            }
-          } else {
-            if (isInstagramPageUrl(item)) {
-              logger.info(`[Instagram] rejected: ${field}[${i}] (URL is Instagram page)`);
-            } else {
-              logger.info(`[Instagram] rejected: ${field}[${i}] (invalid media URL)`);
-            }
-          }
-        } else if (item && typeof item === 'object') {
-          const itemAudio =
-            item.audio_url || item.audioUrl || item.music_url || item.audio || item.mp3;
-          const itemVideo =
-            item.video_url || item.videoUrl || item.download_url || item.media_url || item.url || item.link;
-
-          if (itemAudio) {
-            logger.info(`[Instagram] candidate found: ${field}[${i}].audio_url = ${itemAudio}`);
-            if (!audioUrl && isValidMediaUrl(itemAudio)) {
-              audioUrl = itemAudio;
-              logger.info(`[Instagram] selected: ${field}[${i}].audio_url`);
-            }
-          }
-          if (itemVideo) {
-            logger.info(`[Instagram] candidate found: ${field}[${i}].video_url = ${itemVideo}`);
-            if (!videoUrl && isValidMediaUrl(itemVideo)) {
-              videoUrl = itemVideo;
-              logger.info(`[Instagram] selected: ${field}[${i}].video_url`);
-            }
-          }
-        }
-      }
-    }
-
-    // 5. Fallback to generic 'url' field ONLY if it is a valid direct media URL (not an Instagram page URL!)
-    // (Note: url is already checked in videoFields above, this is a safety fallback for edge cases)
-    if (!videoUrl && payload.url) {
-      logger.info(`[Instagram] candidate found: url = ${payload.url}`);
-      if (isValidMediaUrl(payload.url)) {
-        videoUrl = payload.url;
-        logger.info(`[Instagram] selected: url (fallback)`);
-      } else {
-        if (isInstagramPageUrl(payload.url)) {
-          logger.info(`[Instagram] rejected: url (URL is Instagram page)`);
-        } else {
-          logger.info(`[Instagram] rejected: url (invalid media URL)`);
-        }
-      }
-    }
-  }
-
-  return { videoUrl, audioUrl };
-}
-
-/**
  * Service abstraction for retrieving Instagram Reel video and media URLs.
  * Separated cleanly so provider implementations can be swapped without touching bot logic.
  */
 export async function getInstagramReel(url: string): Promise<InstagramReelMedia> {
+  logger.info('[IG DEBUG] getInstagramReel called with URL:', url);
+  
   const { shortcode, normalizedUrl } = validateAndNormalizeInstagramUrl(url);
+  logger.info('[IG DEBUG] SocialKit request starting');
 
-  const apiUrl = process.env.INSTAGRAM_API_URL || 'https://api.socialkit.dev/instagram/download';
+  const apiUrl = process.env.INSTAGRAM_API_URL;
   const apiKey = process.env.INSTAGRAM_API_KEY;
 
-  if (!apiKey) {
-    logger.warn('INSTAGRAM_API_KEY is not defined in environment variables');
-    throw new InstagramApiError('Instagram API access key is missing. Please set INSTAGRAM_API_KEY in environment.');
+  if (!apiUrl) {
+    logger.error('[IG DEBUG] INSTAGRAM_API_URL is not defined in environment variables');
+    logger.warn('INSTAGRAM_API_URL is not defined in environment variables');
+    throw new InstagramApiError('Instagram API endpoint is not configured. Please set INSTAGRAM_API_URL in environment.');
   }
 
-  logger.info('[Instagram] Instagram shortcode:', shortcode);
-  logger.info('[Instagram] SocialKit request started');
-  logger.info('[Instagram] SocialKit API URL:', apiUrl);
-  logger.info('[Instagram] Normalized Instagram URL:', normalizedUrl);
+  logger.info('[IG DEBUG] SocialKit API URL:', apiUrl);
+  logger.info('[IG DEBUG] Normalized Instagram URL:', normalizedUrl);
+  logger.info('[IG DEBUG] Shortcode:', shortcode);
+  logger.info('[IG DEBUG] API Key:', apiKey ? 'SET' : 'NOT SET');
 
   try {
-    const requestBody = {
-      access_key: apiKey,
-      url: normalizedUrl,
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
     };
 
-    const response = await axios.post(apiUrl, requestBody, {
-      headers: {
-        'Content-Type': 'application/json',
+    if (apiKey) {
+      headers['X-RapidAPI-Key'] = apiKey;
+      headers['x-api-key'] = apiKey;
+      headers['Authorization'] = `Bearer ${apiKey}`;
+    }
+
+    logger.info('[IG DEBUG] Sending GET request to SocialKit with query parameters');
+    logger.info('[IG DEBUG] Query params: { url:', normalizedUrl, ', shortcode:', shortcode, '}');
+    logger.info('[IG DEBUG] Headers:', Object.keys(headers));
+
+    const response = await axios.get(apiUrl, {
+      params: {
+        url: normalizedUrl,
+        shortcode,
       },
-      timeout: 15000,
+      headers,
+      timeout: 12000,
     });
+    logger.info('[IG DEBUG] SocialKit request completed');
 
     const data = response.data;
 
     if (!data) {
-      throw new InstagramApiError('Empty response from SocialKit Instagram service.');
+      logger.error('[IG DEBUG] Empty response from SocialKit');
+      throw new InstagramApiError('Empty response from Instagram extraction service.');
     }
 
     // Add diagnostic logging for SocialKit response structure
-    logger.info('[Instagram] SocialKit HTTP status:', response.status);
-    logger.info('[Instagram] Response Content-Type:', response.headers?.['content-type'] || 'undefined');
-    logger.info('[Instagram] Response top-level keys:', Object.keys(data));
+    logger.info('[IG DEBUG] SocialKit HTTP status:', response.status);
+    logger.info('[IG DEBUG] Response Content-Type:', response.headers?.['content-type'] || 'undefined');
+    logger.info('[IG DEBUG] Response top-level keys:', Object.keys(data));
     
     // Log nested object keys safely
     const topLevelKeys = Object.keys(data);
     for (const key of topLevelKeys) {
       const value = data[key];
       if (value && typeof value === 'object' && !Array.isArray(value)) {
-        logger.info(`[Instagram] nested keys in ${key}:`, Object.keys(value));
+        logger.info(`[IG DEBUG] nested keys in ${key}:`, Object.keys(value));
       } else if (Array.isArray(value)) {
-        logger.info(`[Instagram] ${key} is an array with ${value.length} items`);
+        logger.info(`[IG DEBUG] ${key} is an array with ${value.length} items`);
         if (value.length > 0 && typeof value[0] === 'object') {
-          logger.info(`[Instagram] first item keys in ${key}:`, Object.keys(value[0]));
+          logger.info(`[IG DEBUG] first item keys in ${key}:`, Object.keys(value[0]));
         }
       }
     }
 
     // Log provider status/message/error fields
     if (data.status) {
-      logger.info('[Instagram] Provider status field:', data.status);
+      logger.info('[IG DEBUG] Provider status field:', data.status);
     }
     if (data.message) {
-      logger.info('[Instagram] Provider message field:', data.message);
+      logger.info('[IG DEBUG] Provider message field:', data.message);
     }
     if (data.error) {
-      logger.info('[Instagram] Provider error field:', data.error);
+      logger.info('[IG DEBUG] Provider error field:', data.error);
     }
 
     // Log SocialKit response structure safely without logging API keys
-    logger.info('[Instagram] Full sanitized response:', sanitizeForLog(data));
+    logger.info('[IG DEBUG] Full sanitized response:', sanitizeForLog(data));
 
-    if (data.success === false || data.status === 'error') {
-      const msg = data.message || data.error || 'SocialKit API returned failure status';
-      logger.error('[Instagram] SocialKit API error response:', msg);
+    // Flexible extraction mapping to support standard RapidAPI & generic media APIs
+    // Search for video/media URL in common response shapes:
+    logger.info('[IG DEBUG] Starting flexible media URL extraction');
+    
+    const videoUrl =
+      data.video_url ||
+      data.media_url ||
+      data.url ||
+      data.download_url ||
+      (Array.isArray(data.urls) && data.urls[0]?.url) ||
+      (Array.isArray(data.data) && data.data[0]?.url) ||
+      (data.result && (data.result.video_url || data.result.url || data.result[0]?.url));
 
-      const msgLower = String(msg).toLowerCase();
-      
-      // Only throw PrivateOrDeletedReelError for explicit indicators of private/deleted Reels
-      const isExplicitlyPrivate = 
-        msgLower.includes('this account is private') ||
-        msgLower.includes('private account') ||
-        msgLower.includes('this reel is private');
-      
-      const isExplicitlyDeleted = 
-        msgLower.includes('deleted') &&
-        (msgLower.includes('reel') || msgLower.includes('post'));
-      
-      const isExplicitlyNotFound = 
-        (msgLower.includes('reel not found') || 
-         msgLower.includes('post not found') ||
-         msgLower.includes('page not found'));
-
-      if (isExplicitlyPrivate || isExplicitlyDeleted || isExplicitlyNotFound) {
-        logger.error('[Instagram] Explicitly private/deleted/not found - throwing PrivateOrDeletedReelError');
-        throw new PrivateOrDeletedReelError();
-      }
-      
-      logger.error('[Instagram] API error but not explicitly private/deleted - throwing InstagramApiError');
-      throw new InstagramApiError(`SocialKit API error: ${msg}`);
-    }
-
-    logger.info('[Instagram] Starting media URL extraction from response');
-    const { videoUrl, audioUrl } = extractMediaUrls(data);
-
-    // Log media candidates and selected field
-    logger.info('[Instagram] Media extraction results:', { 
-      videoUrl: videoUrl ? 'found' : 'not found', 
-      audioUrl: audioUrl ? 'found' : 'not found' 
-    });
-
-    const payload = data.data || data.result || data;
+    const audioUrl =
+      data.audio_url ||
+      data.music_url ||
+      (data.result && (data.result.audio_url || data.result.music_url));
 
     const thumbnailUrl =
-      payload.thumbnail_url ||
-      payload.cover_url ||
-      payload.thumbnail ||
       data.thumbnail_url ||
       data.cover_url ||
-      data.thumbnail;
+      data.thumbnail ||
+      (data.result && data.result.thumbnail);
 
     const title =
-      payload.title ||
-      payload.caption ||
       data.title ||
-      data.caption;
+      data.caption ||
+      (data.result && (data.result.title || data.result.caption));
 
-    const finalMediaUrl = videoUrl || audioUrl;
+    logger.info('[IG DEBUG] Extraction results:', {
+      videoUrl: videoUrl ? 'found' : 'not found',
+      audioUrl: audioUrl ? 'found' : 'not found',
+      thumbnailUrl: thumbnailUrl ? 'found' : 'not found',
+      title: title ? 'found' : 'not found'
+    });
 
-    if (!finalMediaUrl) {
-      logger.error('Failed to extract direct media URL from SocialKit API response.', {
-        response: sanitizeForLog(data),
-      });
-
-      // Only throw PrivateOrDeletedReelError if there's clear evidence the Reel is actually private/deleted
-      const rawMsg = data.message || data.error || '';
-      const msgLower = String(rawMsg).toLowerCase();
-      
-      // Check for explicit provider indicators that the Reel is private/deleted
-      const isExplicitlyPrivate = 
-        msgLower.includes('private account') ||
-        msgLower.includes('this account is private') ||
-        msgLower.includes('private reel');
-      
-      const isExplicitlyDeleted = 
-        msgLower.includes('deleted') &&
-        (msgLower.includes('reel') || msgLower.includes('post'));
-      
-      const isExplicitlyNotFound = 
-        (msgLower.includes('reel not found') || 
-         msgLower.includes('post not found') ||
-         msgLower.includes('page not found'));
-
-      if (isExplicitlyPrivate || isExplicitlyDeleted || isExplicitlyNotFound) {
+    if (!videoUrl) {
+      logger.error('[IG DEBUG] No video URL found in response');
+      if (
+        data.status === 404 ||
+        data.error?.includes('private') ||
+        data.message?.includes('private') ||
+        data.message?.includes('not found')
+      ) {
+        logger.error('[IG DEBUG] Explicit private/not found indicators - throwing PrivateOrDeletedReelError');
         throw new PrivateOrDeletedReelError();
       }
-      
-      // Otherwise, it's a parsing/structure issue, not a private/deleted Reel
-      throw new InstagramApiError('Could not find downloadable direct media URL in SocialKit response.');
+      logger.error('[IG DEBUG] No explicit private indicators - throwing InstagramApiError');
+      throw new InstagramApiError('Could not find downloadable media URL in response.');
     }
 
-    logger.info('Instagram direct media URL received', { shortcode, mediaUrl: finalMediaUrl });
+    logger.info('[IG DEBUG] Instagram direct media URL received:', { shortcode, mediaUrl: videoUrl });
 
     return {
       id: shortcode,
-      mediaUrl: finalMediaUrl,
+      mediaUrl: videoUrl,
       audioUrl: audioUrl || undefined,
       title: title || undefined,
       thumbnailUrl: thumbnailUrl || undefined,
     };
   } catch (error: unknown) {
+    logger.error('[IG DEBUG] ERROR name:', error instanceof Error ? error.constructor.name : 'Unknown');
+    logger.error('[IG DEBUG] ERROR message:', error instanceof Error ? error.message : String(error));
+    
     if (
       error instanceof PrivateOrDeletedReelError ||
       error instanceof InstagramApiError
     ) {
+      logger.error('[IG DEBUG] Re-throwing known error type');
       throw error;
     }
 
     if (axios.isAxiosError(error)) {
       const status = error.response?.status;
-      const responseData = error.response?.data;
-      const errorMsg = responseData?.message || responseData?.error || error.message;
+      const errorMsg = error.response?.data?.message || error.message;
 
-      logger.error(`SocialKit Instagram API HTTP error [${status || 'network'}]`, errorMsg);
+      logger.error(`[IG DEBUG] Instagram API HTTP error [${status}]`, errorMsg);
 
-      const msgLower = String(errorMsg).toLowerCase();
-      
-      // Only throw PrivateOrDeletedReelError for explicit indicators of private/deleted Reels
-      const isExplicitlyPrivate = 
-        msgLower.includes('this account is private') ||
-        msgLower.includes('private account') ||
-        msgLower.includes('this reel is private');
-      
-      const isExplicitlyDeleted = 
-        msgLower.includes('deleted') &&
-        (msgLower.includes('reel') || msgLower.includes('post'));
-      
-      const isExplicitlyNotFound = 
-        (msgLower.includes('reel not found') || 
-         msgLower.includes('post not found') ||
-         msgLower.includes('page not found'));
-
-      if ((status === 403 || status === 404) && (isExplicitlyPrivate || isExplicitlyDeleted || isExplicitlyNotFound)) {
+      if (status === 404 || status === 403) {
+        logger.error('[IG DEBUG] HTTP 404/403 - throwing PrivateOrDeletedReelError');
         throw new PrivateOrDeletedReelError();
       }
 
-      throw new InstagramApiError(`SocialKit API returned HTTP ${status || 'error'}: ${errorMsg}`);
+      logger.error('[IG DEBUG] HTTP error but not 404/403 - throwing InstagramApiError');
+      throw new InstagramApiError(`Extraction provider returned HTTP ${status || 'error'}: ${errorMsg}`);
     }
 
-    logger.error('Unexpected error fetching Instagram Reel from SocialKit', error);
+    logger.error('[IG DEBUG] Unexpected error fetching Instagram Reel from SocialKit', error);
     throw new InstagramApiError('Failed to retrieve Instagram Reel media.');
   }
 }
