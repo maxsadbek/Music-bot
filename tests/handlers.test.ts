@@ -176,7 +176,7 @@ describe('Telegram Bot Handlers', () => {
       await handleTextMessage(mockCtx);
 
       // Status message sent initially
-      expect(mockCtx.reply).toHaveBeenCalledWith('🎬 Reel qabul qilindi\n⏳ Video olinmoqda...');
+      expect(mockCtx.reply).toHaveBeenCalledWith('🎬 Reel qabul qilindi');
 
       // Status message was edited
       expect(mockCtx.api.editMessageText).toHaveBeenCalled();

@@ -1,4 +1,4 @@
-import axios, { AxiosError } from 'axios';
+import axios from 'axios';
 import { logger } from '../utils/logger';
 import { validateAndNormalizeInstagramUrl } from '../validation/instagram';
 import {
@@ -23,39 +23,42 @@ const RENDER_DOWNLOADER_URL =
   process.env.RENDER_DOWNLOADER_URL || 'https://musify-downloader.onrender.com';
 
 // ── Timeout configuration ────────────────────────────────────────────────────
-// Render free tier cold-starts after ~15min idle. First request can take 5-30s.
-// We fail fast instead of blocking the user for 30s.
-const API_TIMEOUT_MS = 10_000;       // /api/info and /api/jobs
-const POLL_TIMEOUT_MS = 8_000;       // per poll attempt
-const POLL_INTERVAL_MS = 1500;
-const MAX_POLL_ATTEMPTS = 15;        // 15 × 1.5s = 22.5s max poll time
-const DOWNLOAD_TIMEOUT_MS = 30_000;  // video file download (files can be large)
-const COLD_START_THRESHOLD_MS = 5_000; // if API response >5s, likely cold start
+const API_TIMEOUT_MS = 8_000;
+const POLL_TIMEOUT_MS = 5_000;
+const DOWNLOAD_TIMEOUT_MS = 25_000;
+
+// ── Adaptive polling: fast first polls, then slower ──────────────────────────
+const POLL_DELAYS_MS = [500, 800, 1000, 1200, 1500, 1500, 1500, 1500];
+const MAX_POLL_ATTEMPTS = POLL_DELAYS_MS.length; // 8 attempts max
+
+// ── Shortcode cache ──────────────────────────────────────────────────────────
+const shortcodeCache = new Map<string, { result: InstagramReelMedia; expiresAt: number }>();
+const SHORTCODE_CACHE_TTL_MS = 30 * 60 * 1000;
+
+function getCachedReel(shortcode: string): InstagramReelMedia | null {
+  const e = shortcodeCache.get(shortcode);
+  if (!e) return null;
+  if (Date.now() > e.expiresAt) { shortcodeCache.delete(shortcode); return null; }
+  return e.result;
+}
+
+function setCachedReel(shortcode: string, result: InstagramReelMedia): void {
+  shortcodeCache.set(shortcode, { result, expiresAt: Date.now() + SHORTCODE_CACHE_TTL_MS });
+}
 
 function getTempDir(): string {
   const dir = path.join(os.tmpdir(), 'musify-downloads');
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
+  if (!fs.existsSync(dir)) { fs.mkdirSync(dir, { recursive: true }); }
   return dir;
 }
 
 export function cleanupTempFile(filePath?: string): void {
   if (!filePath) return;
   try {
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-      logger.info('[IG] Cleaned up temp file', { filePath });
-    }
-  } catch (err) {
-    logger.warn('[IG] Failed to clean up temp file', { filePath, error: err });
-  }
+    if (fs.existsSync(filePath)) { fs.unlinkSync(filePath); }
+  } catch { /* ignore */ }
 }
 
-/**
- * Checks whether a given URL string is an Instagram page URL (post, reel, etc.),
- * rather than a direct downloadable media asset URL.
- */
 export function isInstagramPageUrl(urlStr: string): boolean {
   if (!urlStr || typeof urlStr !== 'string') return false;
   try {
@@ -63,27 +66,12 @@ export function isInstagramPageUrl(urlStr: string): boolean {
     const hostname = parsed.hostname.toLowerCase();
     if (hostname === 'instagram.com' || hostname.endsWith('.instagram.com')) {
       const pathname = parsed.pathname.toLowerCase();
-      if (
-        pathname.startsWith('/reel/') ||
-        pathname.startsWith('/reels/') ||
-        pathname.startsWith('/p/') ||
-        pathname.startsWith('/tv/') ||
-        pathname.startsWith('/share/') ||
-        pathname.startsWith('/stories/') ||
-        pathname === '/'
-      ) {
-        return true;
-      }
+      return pathname.startsWith('/reel/') || pathname.startsWith('/reels/') || pathname.startsWith('/p/') || pathname.startsWith('/tv/') || pathname.startsWith('/share/') || pathname.startsWith('/stories/');
     }
-  } catch {
-    return false;
-  }
+  } catch { return false; }
   return false;
 }
 
-/**
- * Validates that a candidate URL string is a valid HTTP(S) URL and NOT an Instagram page URL.
- */
 export function isValidMediaUrl(urlStr: unknown): urlStr is string {
   if (!urlStr || typeof urlStr !== 'string') return false;
   const trimmed = urlStr.trim();
@@ -92,24 +80,14 @@ export function isValidMediaUrl(urlStr: unknown): urlStr is string {
   return true;
 }
 
-/**
- * Recursively redacts sensitive fields (access keys, tokens, secrets) for safe logging.
- */
 export function sanitizeForLog(obj: unknown): unknown {
   if (obj === null || obj === undefined) return obj;
   if (typeof obj !== 'object') return obj;
   if (Array.isArray(obj)) return obj.map(sanitizeForLog);
-
   const sanitized: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
     const lowerKey = key.toLowerCase();
-    if (
-      lowerKey.includes('key') ||
-      lowerKey.includes('token') ||
-      lowerKey.includes('secret') ||
-      lowerKey.includes('auth') ||
-      lowerKey.includes('password')
-    ) {
+    if (lowerKey.includes('key') || lowerKey.includes('token') || lowerKey.includes('secret') || lowerKey.includes('auth') || lowerKey.includes('password')) {
       sanitized[key] = '[REDACTED]';
     } else {
       sanitized[key] = sanitizeForLog(value);
@@ -118,159 +96,65 @@ export function sanitizeForLog(obj: unknown): unknown {
   return sanitized;
 }
 
-/**
- * Extracts a direct media URL from a provider response body.
- * Handles multiple response shapes from various providers.
- */
 function extractMediaUrlFromResponse(data: Record<string, unknown>): string | null {
   const nested = data.data && typeof data.data === 'object' ? (data.data as Record<string, unknown>) : null;
-
   const candidates = [
-    nested?.downloadUrl,
-    nested?.video_url,
-    nested?.media_url,
-    nested?.url,
-    data.video_url,
-    data.media_url,
-    data.url,
-    data.download_url,
-    data.file_url,
-    data.content_url,
+    nested?.downloadUrl, nested?.video_url, nested?.media_url, nested?.url,
+    data.video_url, data.media_url, data.url, data.download_url, data.file_url, data.content_url,
     (Array.isArray(data.urls) && data.urls[0] && (data.urls[0] as Record<string, unknown>).url),
-    (Array.isArray(data.data) && data.data[0] && (data.data[0] as Record<string, unknown>).url),
     (data.result && typeof data.result === 'object' ? (data.result as Record<string, unknown>).video_url : undefined),
     (data.result && typeof data.result === 'object' ? (data.result as Record<string, unknown>).download_url : undefined),
     (data.result && typeof data.result === 'object' ? (data.result as Record<string, unknown>).url : undefined),
-    (data.result && typeof data.result === 'object' && (data.result as Record<string, unknown>).download
-      ? ((data.result as Record<string, unknown>).download as Record<string, unknown>).url
-      : undefined),
   ];
-
   for (const candidate of candidates) {
-    if (typeof candidate === 'string' && !isInstagramPageUrl(candidate)) {
-      return candidate;
-    }
+    if (typeof candidate === 'string' && !isInstagramPageUrl(candidate)) return candidate;
   }
-
   return null;
 }
 
-/**
- * Fetches JSON from a URL with axios timeout.
- * Returns the parsed JSON data, or throws on timeout/error.
- */
-async function fetchJsonWithTimeout(
-  url: string,
-  method: 'GET' | 'POST',
-  body?: Record<string, unknown>,
-  timeoutMs = API_TIMEOUT_MS,
-): Promise<{ data: any; durationMs: number }> {
+async function fetchJsonWithTimeout(url: string, method: 'GET' | 'POST', body?: Record<string, unknown>, timeoutMs = API_TIMEOUT_MS): Promise<{ data: any; durationMs: number }> {
   const start = Date.now();
-
   try {
     const config = { timeout: timeoutMs };
-
-    let response;
-    if (method === 'POST') {
-      response = await axios.post(url, body, config);
-    } else {
-      response = await axios.get(url, config);
-    }
-
-    const durationMs = Date.now() - start;
-    return { data: response.data, durationMs };
+    const response = method === 'POST' ? await axios.post(url, body, config) : await axios.get(url, config);
+    return { data: response.data, durationMs: Date.now() - start };
   } catch (err) {
     const durationMs = Date.now() - start;
     if (axios.isAxiosError(err) && (err.code === 'ECONNABORTED' || err.message?.includes('timeout'))) {
-      logger.warn('[PERF] Downloader TIMEOUT', { url, timeoutMs, durationMs });
-      throw new InstagramApiError(`Downloader request timed out after ${durationMs}ms`);
+      throw new InstagramApiError(`Downloader timeout after ${durationMs}ms`);
     }
     throw err;
   }
 }
 
 /**
- * Service for retrieving Instagram Reel video via the self-hosted Render downloader.
+ * Get Instagram Reel video via self-hosted Render downloader.
  *
- * Flow:
- * 1. POST /api/info  — validate reel URL and get metadata (OPTIONAL — skipped on timeout)
- * 2. POST /api/jobs  — create a download job (REQUIRED)
- * 3. GET  /api/jobs/:id — poll until job completes
- * 4. Download video file to temp + return buffer in memory
+ * Optimized flow:
+ * 1. Check shortcode cache → if HIT, return immediately (~0ms)
+ * 2. POST /api/jobs → create download job (skip /api/info — saves 5-10s)
+ * 3. If response has direct URL → use it immediately (skip polling)
+ * 4. Adaptive poll: 500ms → 800ms → 1000ms → 1500ms (max 8 polls)
+ * 5. Download video to temp + buffer
  */
 export async function getInstagramReel(url: string): Promise<InstagramReelMedia> {
   const totalStart = Date.now();
   const { shortcode, normalizedUrl } = validateAndNormalizeInstagramUrl(url);
 
-  console.log(`[PERF] Instagram downloader START shortcode=${shortcode} url=${RENDER_DOWNLOADER_URL}`);
+  // ── Cache check ────────────────────────────────────────────────────────
+  const cached = getCachedReel(shortcode);
+  if (cached) {
+    console.log(`[PERF] Instagram extraction START shortcode=${shortcode} cache=HIT`);
+    console.log(`[PERF] Instagram extraction TOTAL duration=${Date.now() - totalStart}ms source=cache`);
+    return cached;
+  }
+
+  console.log(`[PERF] Instagram extraction START shortcode=${shortcode}`);
 
   try {
-    // ── 1. POST /api/info — validate reel and get metadata (OPTIONAL) ──────
-    // On Render free tier cold-start, this can take 5-30s. We set a short
-    // timeout and skip metadata if it fails — /api/jobs is the critical path.
-    let title: string | undefined;
-    let thumbnailUrl: string | undefined;
-    let infoFailed = false;
-
-    try {
-      const { data: infoData, durationMs: infoDuration } = await fetchJsonWithTimeout(
-        `${RENDER_DOWNLOADER_URL}/api/info`,
-        'POST',
-        { url: normalizedUrl },
-        API_TIMEOUT_MS,
-      );
-
-      console.log(`[PERF] /api/info response: ${infoDuration}ms`);
-
-      // Cold-start detection: if response >5s, Render was likely cold
-      if (infoDuration > COLD_START_THRESHOLD_MS) {
-        console.log(`[PERF] Downloader cold-start detected: ${infoDuration}ms (threshold ${COLD_START_THRESHOLD_MS}ms)`);
-      }
-
-      if (infoData) {
-        const infoMsg = (infoData.message || infoData.error || '').toLowerCase();
-        if (
-          infoMsg.includes('private') ||
-          infoMsg.includes('deleted') ||
-          infoMsg.includes('unavailable') ||
-          (infoMsg.includes('reel') && infoMsg.includes('not found'))
-        ) {
-          logger.error('[IG] Provider explicitly reports reel as private/deleted/unavailable');
-          throw new PrivateOrDeletedReelError();
-        }
-
-        title = infoData.title || infoData.caption || infoData.description || undefined;
-        thumbnailUrl = infoData.thumbnail || infoData.thumbnail_url || infoData.cover || undefined;
-      }
-    } catch (infoErr: unknown) {
-      // /api/info is optional — skip on timeout and continue to /api/jobs
-      if (infoErr instanceof PrivateOrDeletedReelError) throw infoErr;
-
-      // Check axios error response for private/deleted messages
-      if (axios.isAxiosError(infoErr)) {
-        const providerMsg = (
-          infoErr.response?.data?.message ||
-          infoErr.response?.data?.error ||
-          ''
-        ).toLowerCase();
-        if (
-          providerMsg.includes('private') ||
-          providerMsg.includes('deleted') ||
-          providerMsg.includes('unavailable') ||
-          (providerMsg.includes('reel') && providerMsg.includes('not found'))
-        ) {
-          logger.error('[IG] Provider reports reel as private/deleted via HTTP error');
-          throw new PrivateOrDeletedReelError();
-        }
-      }
-
-      infoFailed = true;
-      logger.warn('[PERF] /api/info FAILED — skipping metadata, continuing to /api/jobs', {
-        error: infoErr instanceof Error ? infoErr.message : String(infoErr),
-      });
-    }
-
-    // ── 2. POST /api/jobs — create download job (REQUIRED) ────────────────
+    // ── 1. POST /api/jobs — create download job (skip /api/info) ─────────
+    // /api/info adds 5-10s on cold start. We skip it entirely.
+    // private/deleted detection happens via /api/jobs error response.
     const jobStart = Date.now();
     const { data: jobData, durationMs: jobDuration } = await fetchJsonWithTimeout(
       `${RENDER_DOWNLOADER_URL}/api/jobs`,
@@ -278,218 +162,143 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
       { url: normalizedUrl, format: 'mp4', quality: '720p' },
       API_TIMEOUT_MS,
     );
-
-    console.log(`[PERF] /api/jobs response: ${jobDuration}ms`);
-
-    if (jobDuration > COLD_START_THRESHOLD_MS) {
-      console.log(`[PERF] Downloader cold-start detected (jobs): ${jobDuration}ms`);
-    }
+    console.log(`[PERF] /api/jobs END duration=${jobDuration}ms`);
 
     if (!jobData) {
       throw new InstagramApiError('Empty response from downloader /api/jobs endpoint.');
     }
 
-    // ── Check response type ───────────────────────────────────────────────
-    const jobId = jobData.jobId || jobData.id || jobData.job_id;
-
-    if (!jobId) {
-      // Some APIs return the file URL directly without a job ID
-      const directUrl = extractMediaUrlFromResponse(jobData);
-      if (directUrl) {
-        console.log(`[PERF] Downloader response type: DIRECT_URL`);
-        const { filePath: videoFilePath, buffer: videoBuffer } = await downloadToTempFile(directUrl, shortcode);
-        logger.info('[PERF] Instagram downloader total', { duration: `${Date.now() - totalStart}ms` });
-        return {
-          id: shortcode,
-          mediaUrl: directUrl,
-          videoFilePath,
-          videoBuffer,
-          title,
-          thumbnailUrl: thumbnailUrl || undefined,
-        };
-      }
-      throw new InstagramApiError('No job ID or direct file URL returned from downloader.');
+    // Check for private/deleted errors in job response
+    const jobMsg = ((jobData.message || jobData.error || '') as string).toLowerCase();
+    if (
+      jobMsg.includes('private') || jobMsg.includes('deleted') ||
+      jobMsg.includes('unavailable') ||
+      (jobMsg.includes('reel') && jobMsg.includes('not found'))
+    ) {
+      throw new PrivateOrDeletedReelError();
     }
 
-    console.log(`[PERF] Downloader response type: JOB_ID jobId=${jobId}`);
+    // ── 2. Check for direct URL in response (skip polling) ───────────────
+    const jobId = jobData.jobId || jobData.id || jobData.job_id;
+    let fileUrl: string;
 
-    // ── 3. Poll job status ────────────────────────────────────────────────
-    const pollStart = Date.now();
-    logger.info('[IG] Step 3: Polling job status', { jobId });
-    const fileUrl = await pollJobStatus(jobId);
-    console.log(`[PERF] Job poll complete: ${Date.now() - pollStart}ms`);
+    if (jobId) {
+      // Check if response already has a file URL
+      const directUrlFromJob =
+        jobData.fileUrl || jobData.file_url || jobData.downloadUrl || jobData.download_url || jobData.url;
+      if (directUrlFromJob && typeof directUrlFromJob === 'string') {
+        console.log(`[PERF] Direct URL from /api/jobs response — skipping poll`);
+        fileUrl = directUrlFromJob;
+      } else {
+        // ── 3. Adaptive poll ─────────────────────────────────────────────
+        const pollStart = Date.now();
+        fileUrl = await pollJobStatus(jobId);
+        console.log(`[PERF] Job poll COMPLETE duration=${Date.now() - pollStart}ms`);
+      }
+    } else {
+      // No job ID — try to extract URL directly from response
+      const directUrl = extractMediaUrlFromResponse(jobData);
+      if (directUrl) {
+        console.log(`[PERF] Direct URL extracted from /api/jobs response`);
+        fileUrl = directUrl;
+      } else {
+        throw new InstagramApiError('No job ID or direct file URL returned from downloader.');
+      }
+    }
 
-    // ── 4. Download video file ────────────────────────────────────────────
+    // ── 4. Download video ────────────────────────────────────────────────
     const dlStart = Date.now();
-    logger.info('[IG] Step 4: Downloading video file');
     const { filePath: videoFilePath, buffer: videoBuffer } = await downloadToTempFile(fileUrl, shortcode);
-    console.log(`[PERF] Video file download: ${Date.now() - dlStart}ms size=${videoBuffer.length}`);
+    console.log(`[PERF] Video download END duration=${Date.now() - dlStart}ms size=${videoBuffer.length}`);
 
-    console.log(`[PERF] Instagram downloader total: ${Date.now() - totalStart}ms infoSkipped=${infoFailed}`);
+    const totalDuration = Date.now() - totalStart;
+    console.log(`[PERF] Instagram extraction TOTAL duration=${totalDuration}ms`);
 
-    return {
+    const result: InstagramReelMedia = {
       id: shortcode,
       mediaUrl: fileUrl,
       videoFilePath,
       videoBuffer,
-      title,
-      thumbnailUrl: thumbnailUrl || undefined,
+      title: jobData.title || jobData.caption || undefined,
+      thumbnailUrl: jobData.thumbnail || jobData.thumbnail_url || undefined,
     };
-  } catch (error: unknown) {
-    logger.error('[PERF] Instagram downloader FAILED', {
-      duration: `${Date.now() - totalStart}ms`,
-    });
 
-    if (
-      error instanceof PrivateOrDeletedReelError ||
-      error instanceof InstagramApiError
-    ) {
-      throw error;
-    }
+    setCachedReel(shortcode, result);
+    return result;
+  } catch (error: unknown) {
+    console.log(`[PERF] Instagram extraction FAILED duration=${Date.now() - totalStart}ms`);
+
+    if (error instanceof PrivateOrDeletedReelError || error instanceof InstagramApiError) throw error;
 
     if (axios.isAxiosError(error)) {
       const status = error.response?.status;
-      const providerMsg =
-        error.response?.data?.message ||
-        error.response?.data?.error ||
-        error.message;
-
-      logger.error(`[IG] Downloader HTTP ${status || 'unknown'}`, providerMsg);
-
+      const providerMsg = error.response?.data?.message || error.response?.data?.error || error.message;
       const lowerMsg = (providerMsg || '').toLowerCase();
-
-      if (
-        lowerMsg.includes('private') ||
-        lowerMsg.includes('deleted') ||
-        lowerMsg.includes('unavailable') ||
-        (lowerMsg.includes('reel') && lowerMsg.includes('not found'))
-      ) {
-        logger.error('[IG] Provider explicitly reports reel as private/deleted/unavailable');
+      if (lowerMsg.includes('private') || lowerMsg.includes('deleted') || lowerMsg.includes('unavailable')) {
         throw new PrivateOrDeletedReelError();
       }
-
-      throw new InstagramApiError(
-        `Downloader returned HTTP ${status || 'error'}: ${providerMsg}`
-      );
+      throw new InstagramApiError(`Downloader HTTP ${status || 'error'}: ${providerMsg}`);
     }
 
-    logger.error('[IG] Unexpected error fetching Instagram Reel', error);
     throw new InstagramApiError('Failed to retrieve Instagram Reel media.');
   }
 }
 
 /**
- * Polls the job status endpoint until the job completes or times out.
- * Uses 8s timeout per poll to avoid blocking on cold Render server.
+ * Adaptive polling: fast first polls (500ms), then slower (1500ms).
+ * Max 8 attempts. Returns file URL when job completes.
  */
 async function pollJobStatus(jobId: string): Promise<string> {
-  for (let attempt = 1; attempt <= MAX_POLL_ATTEMPTS; attempt++) {
-    await sleep(POLL_INTERVAL_MS);
+  for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
+    const delay = POLL_DELAYS_MS[attempt] || 1500;
+    await sleep(delay);
 
     try {
       const { data, durationMs } = await fetchJsonWithTimeout(
         `${RENDER_DOWNLOADER_URL}/api/jobs/${jobId}`,
-        'GET',
-        undefined,
-        POLL_TIMEOUT_MS,
+        'GET', undefined, POLL_TIMEOUT_MS,
       );
 
       const status = (data.status || data.state || '').toLowerCase();
-
-      logger.info('[PERF] IG job poll', {
-        jobId,
-        attempt,
-        status,
-        duration: `${durationMs}ms`,
-      });
+      console.log(`[PERF] Job poll attempt=${attempt + 1} status=${status} duration=${durationMs}ms`);
 
       if (status === 'completed' || status === 'done' || status === 'finished' || status === 'success') {
-        // Job completed — extract file URL
-        const fileUrl =
-          data.fileUrl ||
-          data.file_url ||
-          data.downloadUrl ||
-          data.download_url ||
-          data.url ||
-          (data.result && typeof data.result === 'object'
-            ? (data.result as Record<string, unknown>).url ||
-              (data.result as Record<string, unknown>).file_url ||
-              (data.result as Record<string, unknown>).download_url
-            : undefined);
-
-        if (fileUrl && typeof fileUrl === 'string') {
-          logger.info('[PERF] Job completed with direct URL');
-          return fileUrl;
-        }
-
-        // If no direct file URL, construct it from the job ID
-        const constructedUrl = `${RENDER_DOWNLOADER_URL}/api/jobs/${jobId}/file`;
-        logger.info('[PERF] Job completed, using constructed file URL');
-        return constructedUrl;
+        // Extract file URL from response
+        const fileUrl = data.fileUrl || data.file_url || data.downloadUrl || data.download_url || data.url;
+        if (fileUrl && typeof fileUrl === 'string') return fileUrl;
+        return `${RENDER_DOWNLOADER_URL}/api/jobs/${jobId}/file`;
       }
 
       if (status === 'failed' || status === 'error') {
-        const errorMsg = data.error || data.message || 'Download job failed';
-        throw new InstagramApiError(`Download job failed: ${errorMsg}`);
+        throw new InstagramApiError(`Download job failed: ${data.error || data.message || 'unknown'}`);
       }
-
-      // Job still processing — continue polling
     } catch (err: unknown) {
       if (err instanceof InstagramApiError) throw err;
-      // Transient poll errors — continue polling
-      if (axios.isAxiosError(err)) {
-        logger.warn('[IG] Job poll HTTP error', {
-          jobId,
-          attempt,
-          status: err.response?.status,
-          message: err.message,
-        });
-      } else {
-        logger.warn('[IG] Job poll unexpected error', { jobId, attempt, error: err });
-      }
+      // Transient errors — continue polling
     }
   }
 
-  throw new InstagramApiError(
-    `Download job timed out after ${MAX_POLL_ATTEMPTS * POLL_INTERVAL_MS / 1000}s. The Render server may be cold-starting.`
-  );
+  throw new InstagramApiError(`Download job timed out after ${MAX_POLL_ATTEMPTS} polls. Render server may be cold-starting.`);
 }
 
-/**
- * Downloads a file from a URL to a temp file AND returns the buffer in memory.
- * The temp file is kept for later ffmpeg audio extraction in get_song callbacks.
- * The buffer is used immediately for ACRCloud recognition and Telegram upload.
- */
 async function downloadToTempFile(url: string, shortcode: string): Promise<{ filePath: string; buffer: Buffer }> {
   const start = Date.now();
   const tempDir = getTempDir();
   const filePath = path.join(tempDir, `${shortcode}_${Date.now()}.mp4`);
-
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
 
   try {
     const response = await axios.get(url, {
-      responseType: 'arraybuffer',
-      timeout: DOWNLOAD_TIMEOUT_MS,
-      maxRedirects: 5,
-      signal: controller.signal,
+      responseType: 'arraybuffer', timeout: DOWNLOAD_TIMEOUT_MS, maxRedirects: 5, signal: controller.signal,
     });
-
     const buffer = Buffer.from(response.data);
     fs.writeFileSync(filePath, buffer);
-
-    logger.info('[PERF] Video download to temp file', {
-      size: buffer.length,
-      duration: `${Date.now() - start}ms`,
-    });
-
+    console.log(`[PERF] Video download to file duration=${Date.now() - start}ms size=${buffer.length}`);
     return { filePath, buffer };
   } catch (err: unknown) {
-    const durationMs = Date.now() - start;
     if (axios.isAxiosError(err) && (err.code === 'ECONNABORTED' || err.message?.includes('timeout'))) {
-      logger.error('[PERF] Video download TIMEOUT', { duration: `${durationMs}ms` });
-      throw new InstagramApiError(`Video download timed out after ${durationMs}ms`);
+      throw new InstagramApiError(`Video download timed out after ${Date.now() - start}ms`);
     }
     throw err;
   } finally {

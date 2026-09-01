@@ -377,7 +377,7 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
 
     // Send initial status message
     statusMsg = (await ctx.reply(
-      '🎬 Reel qabul qilindi\n⏳ Video olinmoqda...'
+      '🎬 Reel qabul qilindi'
     )) as { message_id: number };
 
     // If download takes >8s, show cold-start warning to user
@@ -386,7 +386,7 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
         await ctx.api.editMessageText(
           ctx.chat.id,
           statusMsg.message_id,
-          '⏳ Video olinmoqda... (server tayyorlanmoqda, biroz kuting)'
+          '⏳ Video tayyorlanmoqda...'
         ).catch(() => {});
       }
     }, 8_000);
@@ -409,7 +409,7 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
     }
 
     // Step 3: ACRCloud music recognition (on downloaded buffer, BEFORE sending video to user)
-    await editStatus(ctx, statusMsg, '🔍 Musiqa aniqlanmoqda...');
+    await editStatus(ctx, statusMsg, '🔎 Qo' + 'shiq aniqlanmoqda...');
     const recognitionStart = Date.now();
     console.log(`[PERF] ACRCloud recognition START`);
     let songResult: SongResult | undefined;
