@@ -498,8 +498,9 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       await ctx.reply(userError);
     }
   } finally {
-    // Clean up temp video file
-    cleanupTempFile(videoFilePath);
+    // Do NOT delete the temp video file here.
+    // The get_song callback needs it for ffmpeg audio extraction.
+    // It will be cleaned up when the job expires from cache or on next request.
   }
 }
 
@@ -562,6 +563,8 @@ export async function handleCallbackQuery(ctx: Context): Promise<void> {
           job.songTitle,
           job.songArtist
         );
+        // Clean up video file after attempting extraction (whether it succeeded or not)
+        cleanupTempFile(job.videoFilePath);
       }
 
       // Fallback: search and download audio from external source

@@ -15,51 +15,78 @@ export class AudioSourceError extends Error {
   }
 }
 
+/** Invidious instances for YouTube search (rotated on failure). */
+const INVIDIOUS_INSTANCES = [
+  'https://inv.nadeko.net',
+  'https://invidious.fdn.fr',
+  'https://vid.puffyan.us',
+  'https://invidious.nerdvpn.de',
+];
+
+const REQUEST_TIMEOUT = 12_000;
+
 /**
  * Finds the best matching song from search results by comparing title and artist.
  */
-function findBestMatch(results: any[], track: string, artist: string): any {
+function findBestMatch(results: unknown[], track: string, artist: string): unknown | null {
   const lowerTrack = track.toLowerCase();
   const lowerArtist = artist.split(',')[0].trim().toLowerCase();
 
-  return results.find((r: any) => {
-    const rTitle = (r.name || r.title || r.song || '').toLowerCase();
-    const rArtist = (
-      r.artists?.primary?.map((a: any) => a.name).join(', ') ||
-      r.primaryArtists || r.singers || r.artist || ''
-    ).toLowerCase();
+  const scored = results
+    .map((r: any) => {
+      const rTitle = (r.title || r.name || r.song || '').toLowerCase();
+      // For Invidious results the artist is usually in the title, e.g. "Artist - Title (Official Video)"
+      const rArtist = (
+        r.artists?.primary?.map((a: any) => a.name).join(', ') ||
+        r.primaryArtists || r.singers || r.artist ||
+        (rTitle.includes(' - ') ? rTitle.split(' - ')[0] : '')
+      ).toLowerCase().trim();
 
-    return (
-      rTitle.includes(lowerTrack) || lowerTrack.includes(rTitle)
-    ) && (
-      rArtist.includes(lowerArtist) || lowerArtist.includes(rArtist.split(',')[0].trim())
-    );
-  }) || results[0];
+      let score = 0;
+
+      // Title match scoring
+      if (rTitle === lowerTrack) score += 10;
+      else if (rTitle.includes(lowerTrack) || lowerTrack.includes(rTitle)) score += 7;
+      else {
+        // Partial word overlap
+        const trackWords = lowerTrack.split(/\s+/);
+        const titleWords = rTitle.split(/\s+/);
+        const commonWords = trackWords.filter((w: string) => titleWords.some((tw: string) => tw.includes(w) || w.includes(tw)));
+        score += commonWords.length * 2;
+      }
+
+      // Artist match scoring
+      if (rArtist && lowerArtist) {
+        if (rArtist.includes(lowerArtist) || lowerArtist.includes(rArtist.split(',')[0].trim())) {
+          score += 5;
+        }
+      }
+
+      return { result: r, score };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  const best = scored[0];
+  if (best && best.score >= 2) {
+    return best.result;
+  }
+  return scored[0]?.result || null;
 }
 
 /**
- * Extracts the best download URL from a search result.
- * Handles both saavn.dev and direct JioSaavn response formats.
+ * Extracts the best download URL from a saavn/JioSaavn search result.
  */
 function extractDownloadUrl(match: any): string | undefined {
-  // saavn.dev format: downloadUrl is an array of { url, quality, ... }
   const downloadLinks = match.downloadUrl || match.download_url;
   if (Array.isArray(downloadLinks) && downloadLinks.length > 0) {
     const best = downloadLinks[downloadLinks.length - 1];
     return best.url || best.link || best;
   }
-
-  // Direct JioSaavn format: download_url is an array of { link, quality, ... }
-  if (Array.isArray(match.download_url) && match.download_url.length > 0) {
-    const best = match.download_url[match.download_url.length - 1];
-    return best.link || best.url;
-  }
-
   return undefined;
 }
 
 /**
- * Extracts metadata from a search result object.
+ * Extracts metadata from a saavn/JioSaavn search result object.
  */
 function extractMetadata(match: any, fallbackTrack: string, fallbackArtist: string) {
   const title = match.name || match.title || match.song || fallbackTrack;
@@ -79,10 +106,10 @@ function extractMetadata(match: any, fallbackTrack: string, fallbackArtist: stri
 /**
  * Downloads audio from a URL and validates it's actual audio data (not HTML).
  */
-async function downloadAudioBuffer(url: string): Promise<Buffer> {
+async function downloadAudioBuffer(url: string, timeout = 20_000): Promise<Buffer> {
   const response = await axios.get(url, {
     responseType: 'arraybuffer',
-    timeout: 20000,
+    timeout,
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     },
@@ -93,7 +120,6 @@ async function downloadAudioBuffer(url: string): Promise<Buffer> {
     throw new AudioSourceError('Downloaded audio file is empty.');
   }
 
-  // Verify it's not HTML
   const head = buffer.subarray(0, 100).toString('utf-8').trim().toLowerCase();
   if (head.includes('<html') || head.includes('<!doctype')) {
     throw new AudioSourceError('Audio source returned HTML instead of audio data.');
@@ -102,34 +128,173 @@ async function downloadAudioBuffer(url: string): Promise<Buffer> {
   return buffer;
 }
 
+// ─── Provider 1: Invidious (YouTube search + download) ───────────────────────
+
+interface InvidiousVideo {
+  videoId: string;
+  title: string;
+  author: string;
+  lengthSeconds: number;
+  type: string;
+}
+
+/**
+ * Try searching YouTube via Invidious API and download audio.
+ * This provider has virtually all music since YouTube is the world's largest music catalog.
+ */
+async function tryInvidiousYouTube(
+  query: string,
+  track: string,
+  artist: string,
+): Promise<AudioResult | null> {
+  const startTime = Date.now();
+
+  for (const instance of INVIDIOUS_INSTANCES) {
+    try {
+      logger.info('[MUSIC_DL] Invidious YouTube search started', { query, instance });
+
+      const searchUrl = `${instance}/api/v1/search?q=${encodeURIComponent(query)}&type=video&sort_by=relevance`;
+      const searchResponse = await axios.get<InvidiousVideo[]>(searchUrl, {
+        timeout: REQUEST_TIMEOUT,
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+      });
+
+      const videos = searchResponse.data;
+      if (!videos || !Array.isArray(videos) || videos.length === 0) {
+        logger.warn('[MUSIC_DL] Invidious: no search results', {
+          query,
+          instance,
+          duration: `${Date.now() - startTime}ms`,
+        });
+        continue; // try next instance
+      }
+
+      const match = findBestMatch(videos, track, artist) as InvidiousVideo | null;
+      if (!match) {
+        logger.warn('[MUSIC_DL] Invidious: no good match found', {
+          query,
+          resultCount: videos.length,
+          instance,
+          duration: `${Date.now() - startTime}ms`,
+        });
+        continue;
+      }
+
+      // Get video info which contains audio stream URLs
+      const videoInfoUrl = `${instance}/api/v1/videos/${match.videoId}?fields=title,author,lengthSeconds,adaptiveFormats`;
+      const infoResponse = await axios.get(videoInfoUrl, {
+        timeout: REQUEST_TIMEOUT,
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+      });
+
+      const videoInfo = infoResponse.data;
+      const adaptiveFormats = videoInfo.adaptiveFormats || [];
+
+      // Find the best audio-only stream (prefer opus > mp4a > any audio)
+      const audioFormats = adaptiveFormats.filter(
+        (f: any) => f.type?.startsWith('audio/') && f.url,
+      );
+
+      if (audioFormats.length === 0) {
+        logger.warn('[MUSIC_DL] Invidious: no audio streams found', {
+          videoId: match.videoId,
+          instance,
+          duration: `${Date.now() - startTime}ms`,
+        });
+        continue;
+      }
+
+      // Prefer opus (best quality/size), then m4a
+      const audioFormat =
+        audioFormats.find((f: any) => f.type?.includes('opus')) ||
+        audioFormats.find((f: any) => f.type?.includes('mp4a')) ||
+        audioFormats[audioFormats.length - 1];
+
+      logger.info('[MUSIC_DL] Invidious audio stream found', {
+        videoId: match.videoId,
+        title: videoInfo.title,
+        type: audioFormat.type,
+        instance,
+        duration: `${Date.now() - startTime}ms`,
+      });
+
+      const buffer = await downloadAudioBuffer(audioFormat.url, 30_000);
+
+      logger.info('[MUSIC_DL] Invidious download complete', {
+        title: track,
+        artist: artist,
+        size: buffer.length,
+        duration: `${Date.now() - startTime}ms`,
+      });
+
+      return {
+        buffer,
+        title: videoInfo.title || track,
+        artist: videoInfo.author || artist,
+        durationSeconds: videoInfo.lengthSeconds || undefined,
+      };
+    } catch (error: unknown) {
+      if (error instanceof AudioSourceError) throw error;
+      logger.warn('[MUSIC_DL] Invidious instance failed', {
+        instance,
+        error: error instanceof Error ? error.message : String(error),
+        duration: `${Date.now() - startTime}ms`,
+      });
+      // continue to next instance
+    }
+  }
+
+  logger.warn('[MUSIC_DL] Invidious: all instances exhausted', {
+    query,
+    duration: `${Date.now() - startTime}ms`,
+  });
+  return null;
+}
+
+// ─── Provider 2: saavn.dev ────────────────────────────────────────────────────
+
 /**
  * Try searching and downloading from saavn.dev API.
  */
-async function trySaavnDev(query: string, track: string, artist: string): Promise<AudioResult | null> {
+async function trySaavnDev(
+  query: string,
+  track: string,
+  artist: string,
+): Promise<AudioResult | null> {
   const startTime = Date.now();
 
   try {
     logger.info('[MUSIC_DL] saavn.dev search started', { query });
 
     const searchUrl = `https://saavn.dev/api/search/songs?query=${encodeURIComponent(query)}&limit=5`;
-    const searchResponse = await axios.get(searchUrl, { timeout: 10000 });
+    const searchResponse = await axios.get(searchUrl, { timeout: REQUEST_TIMEOUT });
     const results = searchResponse.data?.data?.results;
 
     if (!results || !Array.isArray(results) || results.length === 0) {
-      logger.warn('[MUSIC_DL] saavn.dev: no search results', { query, duration: `${Date.now() - startTime}ms` });
+      logger.warn('[MUSIC_DL] saavn.dev: no search results', {
+        query,
+        duration: `${Date.now() - startTime}ms`,
+      });
       return null;
     }
 
     const match = findBestMatch(results, track, artist);
-    const downloadUrl = extractDownloadUrl(match);
+    if (!match) {
+      logger.warn('[MUSIC_DL] saavn.dev: no good match', {
+        duration: `${Date.now() - startTime}ms`,
+      });
+      return null;
+    }
 
+    const downloadUrl = extractDownloadUrl(match);
     if (!downloadUrl) {
-      logger.warn('[MUSIC_DL] saavn.dev: no download URL in result', { duration: `${Date.now() - startTime}ms` });
+      logger.warn('[MUSIC_DL] saavn.dev: no download URL in result', {
+        duration: `${Date.now() - startTime}ms`,
+      });
       return null;
     }
 
     logger.info('[MUSIC_DL] saavn.dev download URL received', {
-      downloadUrl: downloadUrl.slice(0, 80),
       duration: `${Date.now() - startTime}ms`,
     });
 
@@ -159,10 +324,16 @@ async function trySaavnDev(query: string, track: string, artist: string): Promis
   }
 }
 
+// ─── Provider 3: JioSaavn direct API ─────────────────────────────────────────
+
 /**
  * Try searching and downloading from JioSaavn direct API (fallback).
  */
-async function tryJioSaavnDirect(query: string, track: string, artist: string): Promise<AudioResult | null> {
+async function tryJioSaavnDirect(
+  query: string,
+  track: string,
+  artist: string,
+): Promise<AudioResult | null> {
   const startTime = Date.now();
 
   try {
@@ -179,26 +350,36 @@ async function tryJioSaavnDirect(query: string, track: string, artist: string): 
         n: 5,
         p: 1,
       },
-      timeout: 10000,
+      timeout: REQUEST_TIMEOUT,
       headers: { 'User-Agent': 'Mozilla/5.0' },
     });
 
     const results = searchResponse.data?.results;
     if (!results || !Array.isArray(results) || results.length === 0) {
-      logger.warn('[MUSIC_DL] JioSaavn direct: no search results', { query, duration: `${Date.now() - startTime}ms` });
+      logger.warn('[MUSIC_DL] JioSaavn direct: no search results', {
+        query,
+        duration: `${Date.now() - startTime}ms`,
+      });
       return null;
     }
 
     const match = findBestMatch(results, track, artist);
-    const downloadUrl = extractDownloadUrl(match);
+    if (!match) {
+      logger.warn('[MUSIC_DL] JioSaavn direct: no good match', {
+        duration: `${Date.now() - startTime}ms`,
+      });
+      return null;
+    }
 
+    const downloadUrl = extractDownloadUrl(match);
     if (!downloadUrl) {
-      logger.warn('[MUSIC_DL] JioSaavn direct: no download URL', { duration: `${Date.now() - startTime}ms` });
+      logger.warn('[MUSIC_DL] JioSaavn direct: no download URL', {
+        duration: `${Date.now() - startTime}ms`,
+      });
       return null;
     }
 
     logger.info('[MUSIC_DL] JioSaavn direct download URL received', {
-      downloadUrl: downloadUrl.slice(0, 80),
       duration: `${Date.now() - startTime}ms`,
     });
 
@@ -228,16 +409,18 @@ async function tryJioSaavnDirect(query: string, track: string, artist: string): 
   }
 }
 
+// ─── Main entry point ─────────────────────────────────────────────────────────
+
 /**
- * Acquires the actual audio file for a given track and artist.
+ * Finds and downloads the actual audio file for a given track and artist.
  *
- * This is the audio acquisition layer, intentionally separated from ACRCloud
- * (which is recognition-only). This function searches for and downloads
- * the actual audio content that can be sent to Telegram as a playable audio message.
+ * Provider priority:
+ * 1. Invidious/YouTube — largest catalog, virtually all music
+ * 2. saavn.dev — good for Indian/South Asian music
+ * 3. JioSaavn direct — fallback for Indian/South Asian music
  *
- * Tries saavn.dev API first, then falls back to JioSaavn direct API.
- * This can be swapped for any other legal audio source without affecting
- * the rest of the bot.
+ * Each provider is independent: if one fails, the next is tried.
+ * No single provider failure causes the entire request to fail.
  */
 export async function getSongAudio(track: string, artist: string): Promise<AudioResult> {
   const query = `${track} ${artist}`;
@@ -245,7 +428,16 @@ export async function getSongAudio(track: string, artist: string): Promise<Audio
 
   logger.info('[MUSIC_DL] Music download requested', { track, artist, query });
 
-  // 1. Try saavn.dev first
+  // Provider 1: Invidious/YouTube (largest catalog — has virtually all music)
+  const ytResult = await tryInvidiousYouTube(query, track, artist);
+  if (ytResult) {
+    logger.info('[MUSIC_DL] Music download completed via Invidious/YouTube', {
+      duration: `${Date.now() - startTime}ms`,
+    });
+    return ytResult;
+  }
+
+  // Provider 2: saavn.dev (good for Indian/South Asian music)
   const saavnResult = await trySaavnDev(query, track, artist);
   if (saavnResult) {
     logger.info('[MUSIC_DL] Music download completed via saavn.dev', {
@@ -254,7 +446,7 @@ export async function getSongAudio(track: string, artist: string): Promise<Audio
     return saavnResult;
   }
 
-  // 2. Fallback to JioSaavn direct API
+  // Provider 3: JioSaavn direct API (fallback)
   const jioResult = await tryJioSaavnDirect(query, track, artist);
   if (jioResult) {
     logger.info('[MUSIC_DL] Music download completed via JioSaavn direct', {

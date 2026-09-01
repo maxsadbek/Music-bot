@@ -10,6 +10,15 @@ describe('Audio Source Service', () => {
   });
 
   it('should search saavn.dev and return downloaded audio buffer', async () => {
+    // Invidious returns empty/no results (all instances)
+    const invidiousEmpty = { data: [] };
+    vi.mocked(axios.get)
+      .mockResolvedValueOnce(invidiousEmpty as never) // inv.nadeko.net
+      .mockResolvedValueOnce(invidiousEmpty as never) // invidious.fdn.fr
+      .mockResolvedValueOnce(invidiousEmpty as never) // vid.puffyan.us
+      .mockResolvedValueOnce(invidiousEmpty as never); // invidious.nerdvpn.de
+
+    // saavn.dev returns results
     const mockSearchResponse = {
       data: {
         data: {
@@ -31,8 +40,8 @@ describe('Audio Source Service', () => {
     const mockAudioBuffer = Buffer.from('mock-mp3-bytes');
 
     vi.mocked(axios.get)
-      .mockResolvedValueOnce(mockSearchResponse as never)
-      .mockResolvedValueOnce({ data: mockAudioBuffer } as never);
+      .mockResolvedValueOnce(mockSearchResponse as never) // saavn.dev search
+      .mockResolvedValueOnce({ data: mockAudioBuffer } as never); // saavn.dev download
 
     const result = await getSongAudio('United In Grief', 'Kendrick Lamar');
 
@@ -41,24 +50,31 @@ describe('Audio Source Service', () => {
     expect(result.durationSeconds).toBe(275);
     expect(result.buffer).toEqual(mockAudioBuffer);
 
-    expect(axios.get).toHaveBeenCalledTimes(2);
+    expect(axios.get).toHaveBeenCalledTimes(6);
     expect(axios.get).toHaveBeenNthCalledWith(
-      1,
+      5,
       expect.stringContaining('saavn.dev/api/search/songs'),
-      expect.objectContaining({ timeout: 10000 })
+      expect.objectContaining({ timeout: 12000 })
     );
     expect(axios.get).toHaveBeenNthCalledWith(
-      2,
+      6,
       'https://cdn.example.com/high.mp3',
       expect.objectContaining({ responseType: 'arraybuffer', timeout: 20000 })
     );
   });
 
   it('should fall back to JioSaavn direct API when saavn.dev returns no results', async () => {
+    // Invidious returns empty/no results
+    const invidiousEmpty = { data: [] };
+    vi.mocked(axios.get)
+      .mockResolvedValueOnce(invidiousEmpty as never) // inv.nadeko.net
+      .mockResolvedValueOnce(invidiousEmpty as never) // invidious.fdn.fr
+      .mockResolvedValueOnce(invidiousEmpty as never) // vid.puffyan.us
+      .mockResolvedValueOnce(invidiousEmpty as never); // invidious.nerdvpn.de
+
     // saavn.dev returns empty results
-    vi.mocked(axios.get).mockResolvedValueOnce({
-      data: { data: { results: [] } },
-    } as never);
+    vi.mocked(axios.get)
+      .mockResolvedValueOnce({ data: { data: { results: [] } } } as never);
 
     // JioSaavn direct returns results
     const mockJioResponse = {
@@ -80,8 +96,8 @@ describe('Audio Source Service', () => {
     const mockAudioBuffer = Buffer.from('mock-jio-mp3-bytes');
 
     vi.mocked(axios.get)
-      .mockResolvedValueOnce(mockJioResponse as never)
-      .mockResolvedValueOnce({ data: mockAudioBuffer } as never);
+      .mockResolvedValueOnce(mockJioResponse as never) // jiosaavn search
+      .mockResolvedValueOnce({ data: mockAudioBuffer } as never); // jiosaavn download
 
     const result = await getSongAudio('United In Grief', 'Kendrick Lamar');
 
@@ -89,28 +105,28 @@ describe('Audio Source Service', () => {
     expect(result.artist).toBe('Kendrick Lamar');
     expect(result.buffer).toEqual(mockAudioBuffer);
 
-    // Should have called both saavn.dev and jiosaavn.com
-    expect(axios.get).toHaveBeenCalledTimes(3);
+    // Should have called: 4 invidious + 1 saavn + 1 jiosaavn + 1 download = 7
+    expect(axios.get).toHaveBeenCalledTimes(7);
     expect(axios.get).toHaveBeenNthCalledWith(
-      1,
+      5,
       expect.stringContaining('saavn.dev/api/search/songs'),
       expect.anything()
     );
     expect(axios.get).toHaveBeenNthCalledWith(
-      2,
+      6,
       'https://www.jiosaavn.com/api.php',
       expect.anything()
     );
   });
 
   it('should throw AudioSourceError when no search results are found from any provider', async () => {
-    // Both providers return empty results
-    vi.mocked(axios.get).mockResolvedValueOnce({
-      data: { data: { results: [] } },
-    } as never);
-    vi.mocked(axios.get).mockResolvedValueOnce({
-      data: { results: [] },
-    } as never);
+    // All providers return empty results
+    vi.mocked(axios.get)
+      .mockResolvedValue({ data: [] } as never); // Invidious instances
+    vi.mocked(axios.get)
+      .mockResolvedValue({ data: { data: { results: [] } } } as never); // saavn
+    vi.mocked(axios.get)
+      .mockResolvedValue({ data: { results: [] } } as never); // jiosaavn
 
     await expect(getSongAudio('Unknown Track', 'Unknown Artist')).rejects.toThrow(
       AudioSourceError
@@ -118,6 +134,15 @@ describe('Audio Source Service', () => {
   });
 
   it('should throw AudioSourceError when download returns HTML', async () => {
+    // Invidious returns empty
+    const invidiousEmpty = { data: [] };
+    vi.mocked(axios.get)
+      .mockResolvedValueOnce(invidiousEmpty as never)
+      .mockResolvedValueOnce(invidiousEmpty as never)
+      .mockResolvedValueOnce(invidiousEmpty as never)
+      .mockResolvedValueOnce(invidiousEmpty as never);
+
+    // saavn.dev returns results but download returns HTML
     vi.mocked(axios.get)
       .mockResolvedValueOnce({
         data: {

@@ -197,8 +197,8 @@ describe('Telegram Bot Handlers', () => {
       // Status message deleted after video sent
       expect(mockCtx.api.deleteMessage).toHaveBeenCalledWith(12345, 100);
 
-      // Temp file cleaned up
-      expect(instagramService.cleanupTempFile).toHaveBeenCalledWith('/tmp/DRU4smMj0cu.mp4');
+      // Temp file is NOT cleaned up here — it's kept for the get_song callback
+      // cleanupTempFile is called in handleCallbackQuery after ffmpeg extraction
     });
 
     it('should send video with fallback caption when music recognition finds no match', async () => {
