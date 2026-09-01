@@ -53,6 +53,7 @@ export async function POST(req: Request): Promise<Response> {
 
     // ── 2. Parse the update body (fast, <5ms) ────────────────────────
     const update = await req.json();
+    console.log(`[PERF] Webhook POST received update_id=${update.update_id}`);
 
     // Quick sanity check: is this a valid Telegram update?
     if (!update || typeof update.update_id !== 'number') {

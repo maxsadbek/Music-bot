@@ -202,10 +202,7 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
   const totalStart = Date.now();
   const { shortcode, normalizedUrl } = validateAndNormalizeInstagramUrl(url);
 
-  logger.info('[PERF] Instagram downloader START', {
-    shortcode,
-    renderDownloaderUrl: RENDER_DOWNLOADER_URL,
-  });
+  console.log(`[PERF] Instagram downloader START shortcode=${shortcode} url=${RENDER_DOWNLOADER_URL}`);
 
   try {
     // ── 1. POST /api/info — validate reel and get metadata (OPTIONAL) ──────
@@ -223,17 +220,11 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
         API_TIMEOUT_MS,
       );
 
-      logger.info('[PERF] /api/info response', {
-        status: 'ok',
-        duration: `${infoDuration}ms`,
-      });
+      console.log(`[PERF] /api/info response: ${infoDuration}ms`);
 
       // Cold-start detection: if response >5s, Render was likely cold
       if (infoDuration > COLD_START_THRESHOLD_MS) {
-        logger.warn('[PERF] Downloader cold-start / response delay', {
-          duration: `${infoDuration}ms`,
-          threshold: `${COLD_START_THRESHOLD_MS}ms`,
-        });
+        console.log(`[PERF] Downloader cold-start detected: ${infoDuration}ms (threshold ${COLD_START_THRESHOLD_MS}ms)`);
       }
 
       if (infoData) {
@@ -288,16 +279,10 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
       API_TIMEOUT_MS,
     );
 
-    logger.info('[PERF] /api/jobs response', {
-      status: 'ok',
-      duration: `${jobDuration}ms`,
-    });
+    console.log(`[PERF] /api/jobs response: ${jobDuration}ms`);
 
     if (jobDuration > COLD_START_THRESHOLD_MS) {
-      logger.warn('[PERF] Downloader cold-start / response delay', {
-        step: '/api/jobs',
-        duration: `${jobDuration}ms`,
-      });
+      console.log(`[PERF] Downloader cold-start detected (jobs): ${jobDuration}ms`);
     }
 
     if (!jobData) {
@@ -311,10 +296,7 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
       // Some APIs return the file URL directly without a job ID
       const directUrl = extractMediaUrlFromResponse(jobData);
       if (directUrl) {
-        logger.info('[PERF] Downloader response type: DIRECT_URL', {
-          hasUrl: true,
-          duration: `${Date.now() - totalStart}ms`,
-        });
+        console.log(`[PERF] Downloader response type: DIRECT_URL`);
         const { filePath: videoFilePath, buffer: videoBuffer } = await downloadToTempFile(directUrl, shortcode);
         logger.info('[PERF] Instagram downloader total', { duration: `${Date.now() - totalStart}ms` });
         return {
@@ -329,27 +311,21 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
       throw new InstagramApiError('No job ID or direct file URL returned from downloader.');
     }
 
-    logger.info('[PERF] Downloader response type: JOB_ID', { jobId });
+    console.log(`[PERF] Downloader response type: JOB_ID jobId=${jobId}`);
 
     // ── 3. Poll job status ────────────────────────────────────────────────
     const pollStart = Date.now();
     logger.info('[IG] Step 3: Polling job status', { jobId });
     const fileUrl = await pollJobStatus(jobId);
-    logger.info('[PERF] Job poll complete', { duration: `${Date.now() - pollStart}ms` });
+    console.log(`[PERF] Job poll complete: ${Date.now() - pollStart}ms`);
 
     // ── 4. Download video file ────────────────────────────────────────────
     const dlStart = Date.now();
     logger.info('[IG] Step 4: Downloading video file');
     const { filePath: videoFilePath, buffer: videoBuffer } = await downloadToTempFile(fileUrl, shortcode);
-    logger.info('[PERF] Video file download', {
-      size: videoBuffer.length,
-      duration: `${Date.now() - dlStart}ms`,
-    });
+    console.log(`[PERF] Video file download: ${Date.now() - dlStart}ms size=${videoBuffer.length}`);
 
-    logger.info('[PERF] Instagram downloader total', {
-      duration: `${Date.now() - totalStart}ms`,
-      infoSkipped: infoFailed,
-    });
+    console.log(`[PERF] Instagram downloader total: ${Date.now() - totalStart}ms infoSkipped=${infoFailed}`);
 
     return {
       id: shortcode,

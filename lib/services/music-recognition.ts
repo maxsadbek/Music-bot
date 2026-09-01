@@ -161,12 +161,12 @@ export async function identifySong(audioOrVideoUrlOrBuffer: string | Buffer): Pr
     formData.append('timestamp', timestamp);
 
     const acrApiStart = Date.now();
-    logger.info('[PERF] ACRCloud API request', { endpoint, sampleBytes: sampleBuffer.length });
+    console.log(`[PERF] ACRCloud API request START sampleBytes=${sampleBuffer.length}`);
 
     const response = await axios.post(endpoint, formData, {
       timeout: 15000,
     });
-    logger.info('[PERF] ACRCloud API response', { duration: `${Date.now() - acrApiStart}ms` });
+    console.log(`[PERF] ACRCloud API response END: ${Date.now() - acrApiStart}ms`);
 
     const data = response.data;
 
@@ -220,11 +220,7 @@ export async function identifySong(audioOrVideoUrlOrBuffer: string | Buffer): Pr
       spotifyUrl: spotifyUrl || undefined,
     };
 
-    logger.info('[PERF] ACRCloud recognition complete', {
-      artist: songResult.artist,
-      title: songResult.title,
-      totalDuration: `${Date.now() - totalStart}ms`,
-    });
+    console.log(`[PERF] ACRCloud recognition END: ${Date.now() - totalStart}ms artist=${songResult.artist} title=${songResult.title}`);
 
     return songResult;
   } catch (error: unknown) {

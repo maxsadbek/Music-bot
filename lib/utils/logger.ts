@@ -1,6 +1,10 @@
 /**
  * Sanitizing Structured Logger for Musify
  * Ensures no bot tokens, API keys, or sensitive credentials leak into logs.
+ *
+ * IMPORTANT: All output goes through console.log as a SINGLE string argument.
+ * Vercel Serverless may not capture multi-argument console.log calls correctly,
+ * so we stringify all metadata into the message string.
  */
 
 const SECRETS_TO_MASK = [
@@ -21,29 +25,39 @@ function sanitize(message: string): string {
   return sanitized;
 }
 
+/**
+ * Stringify meta objects into a single safe string for logging.
+ * Handles circular references and long values gracefully.
+ */
+function stringifyMeta(meta: unknown[]): string {
+  if (meta.length === 0) return '';
+  const obj = meta.length === 1 ? meta[0] : meta;
+  try {
+    return ' ' + JSON.stringify(obj);
+  } catch {
+    return ' ' + String(obj);
+  }
+}
+
 export const logger = {
   info: (msg: string, ...meta: unknown[]) => {
     const formatted = sanitize(msg);
-    if (meta.length > 0) {
-      console.log(`[INFO] ${formatted}`, ...meta);
-    } else {
-      console.log(`[INFO] ${formatted}`);
-    }
+    const metaStr = stringifyMeta(meta);
+    console.log(`[INFO] ${formatted}${metaStr}`);
   },
   warn: (msg: string, ...meta: unknown[]) => {
     const formatted = sanitize(msg);
-    if (meta.length > 0) {
-      console.warn(`[WARN] ${formatted}`, ...meta);
-    } else {
-      console.warn(`[WARN] ${formatted}`);
-    }
+    const metaStr = stringifyMeta(meta);
+    console.warn(`[WARN] ${formatted}${metaStr}`);
   },
   error: (msg: string, error?: unknown) => {
     const formatted = sanitize(msg);
     if (error instanceof Error) {
-      console.error(`[ERROR] ${formatted}: ${sanitize(error.message)}`, error.stack ? sanitize(error.stack) : '');
+      const stack = error.stack ? sanitize(error.stack) : '';
+      console.error(`[ERROR] ${formatted}: ${sanitize(error.message)} ${stack}`);
     } else if (error) {
-      console.error(`[ERROR] ${formatted}`, error);
+      const metaStr = stringifyMeta([error]);
+      console.error(`[ERROR] ${formatted}${metaStr}`);
     } else {
       console.error(`[ERROR] ${formatted}`);
     }

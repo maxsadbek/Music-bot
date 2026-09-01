@@ -342,6 +342,7 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
   try {
     const { normalizedUrl, shortcode } = validateAndNormalizeInstagramUrl(urlInText);
     const overallStart = Date.now();
+    console.log(`[PERF] handleTextMessage START shortcode=${shortcode}`);
 
     // Duplicate request protection: check if we recently processed this shortcode
     const existingJob = await getCachedJobByShortcode(shortcode);
@@ -410,18 +411,15 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
     // Step 3: ACRCloud music recognition (on downloaded buffer, BEFORE sending video to user)
     await editStatus(ctx, statusMsg, '🔍 Musiqa aniqlanmoqda...');
     const recognitionStart = Date.now();
+    console.log(`[PERF] ACRCloud recognition START`);
     let songResult: SongResult | undefined;
     try {
       songResult = await identifySong(downloadedBuffer || reelMedia.mediaUrl);
       if (songResult) {
-        logger.info(`[PERF] Recognition result: ${songResult.artist} - ${songResult.title}`, {
-          duration: `${Date.now() - recognitionStart}ms`,
-        });
+        console.log(`[PERF] ACRCloud recognition END: ${Date.now() - recognitionStart}ms artist=${songResult.artist} title=${songResult.title}`);
       }
     } catch (musicErr) {
-      logger.info('[PERF] ACRCloud failed', {
-        duration: `${Date.now() - recognitionStart}ms`,
-      });
+      console.log(`[PERF] ACRCloud failed: ${Date.now() - recognitionStart}ms`);
       if (musicErr instanceof MusicNotFoundError) {
         logger.info('No music recognized for reel', { shortcode });
       } else {
@@ -469,6 +467,7 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
 
     // Step 6: Send video with final caption + button
     const videoStart = Date.now();
+    console.log(`[PERF] Telegram upload START`);
     const videoSent = await sendReelVideoToTelegram(
       ctx,
       reelMedia.mediaUrl,
@@ -477,18 +476,13 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       keyboard,
       downloadedBuffer
     );
-    logger.info('[PERF] Telegram video send', {
-      duration: `${Date.now() - videoStart}ms`,
-    });
+    console.log(`[PERF] Telegram upload END: ${Date.now() - videoStart}ms`);
 
     if (!videoSent) {
       throw new Error('Telegram video send failed');
     }
 
-    logger.info('[PERF] Total request', {
-      duration: `${Date.now() - overallStart}ms`,
-      jobId,
-    });
+    console.log(`[PERF] TOTAL PROCESSING: ${Date.now() - overallStart}ms jobId=${jobId}`);
   } catch (error: unknown) {
     logger.error('Error handling Instagram Reel URL', error);
     const userError = formatErrorMessage(error);
