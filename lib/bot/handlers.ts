@@ -573,10 +573,9 @@ export async function handleCallbackQuery(ctx: Context): Promise<void> {
       // Fallback: search and download audio from external source
       if (!sent) {
         const downloadStart = Date.now();
+        console.log(`[PERF] Audio search START query="${job.songTitle} - ${job.songArtist}"`);
         const audio = await getSongAudio(job.songTitle, job.songArtist);
-        logger.info('[PERF] Music download fallback', {
-          duration: `${Date.now() - downloadStart}ms`,
-        });
+        console.log(`[PERF] Audio search END: ${Date.now() - downloadStart}ms result=FOUND`);
 
         await ctx.api.sendAudio(
           chatId,
