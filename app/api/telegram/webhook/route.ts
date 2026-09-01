@@ -86,7 +86,7 @@ export async function POST(req: Request): Promise<Response> {
 async function processUpdateInBackground(update: Record<string, unknown>): Promise<void> {
   const start = Date.now();
   try {
-    const bot = getBot();
+    const bot = await getBot();
     await bot.handleUpdate(update as any);
     logger.info('[Webhook] Update processed', {
       duration: `${Date.now() - start}ms`,

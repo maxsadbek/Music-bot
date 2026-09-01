@@ -44,13 +44,33 @@ export function createBot(): Bot {
 }
 
 /**
- * Lazy singleton instance for serverless function reuse
+ * Lazy singleton instance for serverless function reuse.
+ * The initialization promise is cached so bot.init() is only called
+ * once per cold start — subsequent requests reuse the same instance.
  */
 let botInstance: Bot | null = null;
+let botInitPromise: Promise<Bot> | null = null;
 
-export function getBot(): Bot {
-  if (!botInstance) {
-    botInstance = createBot();
+export async function getBot(): Promise<Bot> {
+  if (botInstance) {
+    return botInstance;
   }
+
+  if (!botInitPromise) {
+    botInitPromise = (async () => {
+      const bot = createBot();
+      await bot.init();
+      logger.info('[Bot] Bot initialized successfully', {
+        username: bot.botInfo.username,
+      });
+      return bot;
+    })().catch((err) => {
+      // Reset so a future call can retry on cold start
+      botInitPromise = null;
+      throw err;
+    });
+  }
+
+  botInstance = await botInitPromise;
   return botInstance;
 }
