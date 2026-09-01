@@ -143,20 +143,20 @@ describe('Render Downloader Instagram Service', () => {
       expect(mockedAxios.post).toHaveBeenCalledWith(
         'https://musify-downloader.onrender.com/api/info',
         { url: 'https://www.instagram.com/reel/TEST123/' },
-        { timeout: 30_000 }
+        { timeout: 10_000 }
       );
 
       // Verify /api/jobs was called
       expect(mockedAxios.post).toHaveBeenCalledWith(
         'https://musify-downloader.onrender.com/api/jobs',
         { url: 'https://www.instagram.com/reel/TEST123/', format: 'mp4', quality: '720p' },
-        { timeout: 30_000 }
+        { timeout: 10_000 }
       );
 
       // Verify polling happened
       expect(mockedAxios.get).toHaveBeenCalledWith(
         'https://musify-downloader.onrender.com/api/jobs/job_abc123',
-        { timeout: 15_000 }
+        { timeout: 8_000 }
       );
 
       // Verify result

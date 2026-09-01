@@ -379,9 +379,25 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       '🎬 Reel qabul qilindi\n⏳ Video olinmoqda...'
     )) as { message_id: number };
 
+    // If download takes >8s, show cold-start warning to user
+    const slowWarningTimer = setTimeout(async () => {
+      if (statusMsg && ctx.chat?.id) {
+        await ctx.api.editMessageText(
+          ctx.chat.id,
+          statusMsg.message_id,
+          '⏳ Video olinmoqda... (server tayyorlanmoqda, biroz kuting)'
+        ).catch(() => {});
+      }
+    }, 8_000);
+
     // Step 1: Fetch video via self-hosted Render downloader
-    // This handles: POST /api/info → POST /api/jobs → poll → download to temp file
-    const reelMedia = await getInstagramReel(normalizedUrl);
+    // This handles: POST /api/info → POST /api/jobs → poll → download to temp file + buffer
+    let reelMedia;
+    try {
+      reelMedia = await getInstagramReel(normalizedUrl);
+    } finally {
+      clearTimeout(slowWarningTimer);
+    }
     videoFilePath = reelMedia.videoFilePath;
 
     // Buffer returned directly from Instagram downloader —
