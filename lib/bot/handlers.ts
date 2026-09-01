@@ -381,29 +381,14 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
 
     // Step 1: Fetch video via self-hosted Render downloader
     // This handles: POST /api/info → POST /api/jobs → poll → download to temp file
-    await editStatus(ctx, statusMsg, '🎬 Reel qabul qilindi\n⏳ Video tayyorlanmoqda...');
-    const instagramStart = Date.now();
     const reelMedia = await getInstagramReel(normalizedUrl);
     videoFilePath = reelMedia.videoFilePath;
-    logger.info('[PERF] Instagram downloader', {
-      duration: `${Date.now() - instagramStart}ms`,
-    });
 
-    // Step 2: Pre-download video buffer (for Telegram upload fallback + ACRCloud)
-    const downloadStart = Date.now();
-    let downloadedBuffer: Buffer | undefined;
-    try {
-      if (videoFilePath && fs.existsSync(videoFilePath)) {
-        downloadedBuffer = fs.readFileSync(videoFilePath);
-      } else {
-        downloadedBuffer = await downloadMediaBuffer(reelMedia.mediaUrl);
-      }
-      logger.info('[PERF] Video buffer', {
-        duration: `${Date.now() - downloadStart}ms`,
-        size: downloadedBuffer?.length,
-      });
-    } catch (downloadErr) {
-      logger.warn('Pre-downloading media buffer failed, falling back to URL', downloadErr);
+    // Buffer returned directly from Instagram downloader —
+    // eliminates disk re-read and potential re-download
+    const downloadedBuffer = reelMedia.videoBuffer;
+    if (downloadedBuffer) {
+      logger.info('[PERF] Video buffer ready (from downloader)', { size: downloadedBuffer.length });
     }
 
     // Step 3: ACRCloud music recognition (on downloaded buffer, BEFORE sending video to user)
@@ -412,9 +397,11 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
     let songResult: SongResult | undefined;
     try {
       songResult = await identifySong(downloadedBuffer || reelMedia.mediaUrl);
-      logger.info('[PERF] ACRCloud', {
-        duration: `${Date.now() - recognitionStart}ms`,
-      });
+      if (songResult) {
+        logger.info(`[PERF] Recognition result: ${songResult.artist} - ${songResult.title}`, {
+          duration: `${Date.now() - recognitionStart}ms`,
+        });
+      }
     } catch (musicErr) {
       logger.info('[PERF] ACRCloud failed', {
         duration: `${Date.now() - recognitionStart}ms`,
@@ -436,7 +423,7 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       keyboard = buildGetSongKeyboard(jobId);
     }
 
-    // Step 5: Save job to cache
+    // Step 5: Save job to cache (parallel with status delete)
     const jobData: ReelJobData = {
       jobId,
       reelUrl: normalizedUrl,
@@ -452,17 +439,19 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       songReleaseDate: songResult?.releaseDate,
     };
 
-    await saveReelJob(jobData);
-    await cacheJobByShortcode(shortcode, jobId);
+    // Save job + cache + delete status in parallel (independent operations)
+    const saveStart = Date.now();
+    await Promise.all([
+      saveReelJob(jobData),
+      cacheJobByShortcode(shortcode, jobId),
+      ...(statusMsg && ctx.chat?.id
+        ? [ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id).catch(() => {})]
+        : []),
+    ]);
+    statusMsg = undefined; // prevent double-delete in finally
+    logger.info('[PERF] Job cache save', { duration: `${Date.now() - saveStart}ms` });
 
-    // Step 6: Delete status message, then send video with final caption + button
-    if (statusMsg && ctx.chat?.id) {
-      await ctx.api
-        .deleteMessage(ctx.chat.id, statusMsg.message_id)
-        .catch(() => {});
-      statusMsg = undefined; // prevent double-delete in finally
-    }
-
+    // Step 6: Send video with final caption + button
     const videoStart = Date.now();
     const videoSent = await sendReelVideoToTelegram(
       ctx,
@@ -472,7 +461,7 @@ export async function handleTextMessage(ctx: Context): Promise<void> {
       keyboard,
       downloadedBuffer
     );
-    logger.info('[PERF] Telegram video', {
+    logger.info('[PERF] Telegram video send', {
       duration: `${Date.now() - videoStart}ms`,
     });
 

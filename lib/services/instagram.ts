@@ -13,6 +13,7 @@ export interface InstagramReelMedia {
   id: string;
   mediaUrl: string;
   videoFilePath?: string;
+  videoBuffer?: Buffer;
   title?: string;
   thumbnailUrl?: string;
   duration?: number;
@@ -21,8 +22,8 @@ export interface InstagramReelMedia {
 const RENDER_DOWNLOADER_URL =
   process.env.RENDER_DOWNLOADER_URL || 'https://musify-downloader.onrender.com';
 
-const POLL_INTERVAL_MS = 2000;
-const MAX_POLL_ATTEMPTS = 30;
+const POLL_INTERVAL_MS = 1500;
+const MAX_POLL_ATTEMPTS = 40;
 const JOB_TIMEOUT_MS = 60_000;
 
 function getTempDir(): string {
@@ -155,26 +156,30 @@ function extractMediaUrlFromResponse(data: Record<string, unknown>): string | nu
  * 1. POST /api/info  — validate reel URL and get metadata
  * 2. POST /api/jobs  — create a download job
  * 3. GET  /api/jobs/:id — poll until job completes
- * 4. GET  /api/jobs/:id/file — download the video file
+ * 4. Download video file to temp + return buffer in memory
  */
 export async function getInstagramReel(url: string): Promise<InstagramReelMedia> {
+  const totalStart = Date.now();
   const { shortcode, normalizedUrl } = validateAndNormalizeInstagramUrl(url);
 
-  logger.info('[IG] Instagram request started', {
+  logger.info('[PERF] Instagram downloader started', {
     shortcode,
     renderDownloaderUrl: RENDER_DOWNLOADER_URL,
   });
 
   try {
     // 1. POST /api/info — validate reel and get metadata
+    const infoStart = Date.now();
     logger.info('[IG] Step 1: Validating reel via /api/info');
     const infoResponse = await axios.post(
       `${RENDER_DOWNLOADER_URL}/api/info`,
       { url: normalizedUrl },
       { timeout: 30_000 }
     );
-    logger.info('[IG] /api/info response status:', infoResponse.status);
-    logger.info('[IG] /api/info response body:', sanitizeForLog(infoResponse.data));
+    logger.info('[PERF] /api/info response', {
+      status: infoResponse.status,
+      duration: `${Date.now() - infoStart}ms`,
+    });
 
     const infoData = infoResponse.data;
     if (!infoData) {
@@ -197,14 +202,17 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
     const thumbnailUrl = infoData.thumbnail || infoData.thumbnail_url || infoData.cover || undefined;
 
     // 2. POST /api/jobs — create download job
+    const jobStart = Date.now();
     logger.info('[IG] Step 2: Creating download job via /api/jobs');
     const jobResponse = await axios.post(
       `${RENDER_DOWNLOADER_URL}/api/jobs`,
       { url: normalizedUrl, format: 'mp4', quality: '720p' },
       { timeout: 30_000 }
     );
-    logger.info('[IG] /api/jobs response status:', jobResponse.status);
-    logger.info('[IG] /api/jobs response body:', sanitizeForLog(jobResponse.data));
+    logger.info('[PERF] /api/jobs response', {
+      status: jobResponse.status,
+      duration: `${Date.now() - jobStart}ms`,
+    });
 
     const jobData = jobResponse.data;
     if (!jobData) {
@@ -217,11 +225,13 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
       const directUrl = extractMediaUrlFromResponse(jobData);
       if (directUrl) {
         logger.info('[IG] Direct file URL returned from /api/jobs');
-        const videoFilePath = await downloadToTempFile(directUrl, shortcode);
+        const { filePath: videoFilePath, buffer: videoBuffer } = await downloadToTempFile(directUrl, shortcode);
+        logger.info('[PERF] Instagram downloader total', { duration: `${Date.now() - totalStart}ms` });
         return {
           id: shortcode,
           mediaUrl: directUrl,
           videoFilePath,
+          videoBuffer,
           title,
           thumbnailUrl: thumbnailUrl || undefined,
         };
@@ -230,21 +240,30 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
     }
 
     // 3. GET /api/jobs/:id — poll until job completes
+    const pollStart = Date.now();
     logger.info('[IG] Step 3: Polling job status', { jobId });
     const fileUrl = await pollJobStatus(jobId);
+    logger.info('[PERF] Job poll complete', { duration: `${Date.now() - pollStart}ms` });
 
-    // 4. GET /api/jobs/:id/file — download the video file
+    // 4. Download video file to temp + buffer in memory
+    const dlStart = Date.now();
     logger.info('[IG] Step 4: Downloading video file');
-    const videoFilePath = await downloadToTempFile(fileUrl, shortcode);
+    const { filePath: videoFilePath, buffer: videoBuffer } = await downloadToTempFile(fileUrl, shortcode);
+    logger.info('[PERF] Video file download', { duration: `${Date.now() - dlStart}ms` });
+
+    logger.info('[PERF] Instagram downloader total', { duration: `${Date.now() - totalStart}ms` });
 
     return {
       id: shortcode,
       mediaUrl: fileUrl,
       videoFilePath,
+      videoBuffer,
       title,
       thumbnailUrl: thumbnailUrl || undefined,
     };
   } catch (error: unknown) {
+    logger.error('[PERF] Instagram downloader failed', { duration: `${Date.now() - totalStart}ms` });
+
     if (
       error instanceof PrivateOrDeletedReelError ||
       error instanceof InstagramApiError
@@ -301,7 +320,7 @@ async function pollJobStatus(jobId: string): Promise<string> {
       const data = statusResponse.data;
       const status = (data.status || data.state || '').toLowerCase();
 
-      logger.info('[IG] Job poll', { jobId, attempt, status });
+      logger.info('[PERF] IG job poll', { jobId, attempt, status });
 
       if (status === 'completed' || status === 'done' || status === 'finished' || status === 'success') {
         // Job completed — extract file URL
@@ -353,9 +372,13 @@ async function pollJobStatus(jobId: string): Promise<string> {
 }
 
 /**
- * Downloads a file from a URL to a temp file and returns the local path.
+ * Downloads a file from a URL to a temp file AND returns the buffer in memory.
+ * The temp file is kept for later ffmpeg audio extraction in get_song callbacks.
+ * The buffer is used immediately for ACRCloud recognition and Telegram upload —
+ * avoiding a redundant disk read or re-download.
  */
-async function downloadToTempFile(url: string, shortcode: string): Promise<string> {
+async function downloadToTempFile(url: string, shortcode: string): Promise<{ filePath: string; buffer: Buffer }> {
+  const start = Date.now();
   const tempDir = getTempDir();
   const filePath = path.join(tempDir, `${shortcode}_${Date.now()}.mp4`);
 
@@ -368,12 +391,12 @@ async function downloadToTempFile(url: string, shortcode: string): Promise<strin
   const buffer = Buffer.from(response.data);
   fs.writeFileSync(filePath, buffer);
 
-  logger.info('[IG] Downloaded video to temp file', {
-    filePath,
+  logger.info('[PERF] Video download to temp file', {
     size: buffer.length,
+    duration: `${Date.now() - start}ms`,
   });
 
-  return filePath;
+  return { filePath, buffer };
 }
 
 function sleep(ms: number): Promise<void> {
