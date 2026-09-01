@@ -19,11 +19,30 @@ export class AudioSourceError extends Error {
 const INVIDIOUS_INSTANCES = [
   'https://inv.nadeko.net',
   'https://invidious.fdn.fr',
-  'https://vid.puffyan.us',
   'https://invidious.nerdvpn.de',
+  'https://vid.puffyan.us',
+  'https://iv.ggtyler.dev',
+  'https://invidious.privacyredirect.com',
+  'https://yt.artemislena.eu',
+  'https://invidious.lunar.icu',
 ];
 
-const REQUEST_TIMEOUT = 12_000;
+const INVIDIOUS_TIMEOUT = 10_000;
+const SAAVN_TIMEOUT = 10_000;
+const JIOSAAVN_TIMEOUT = 10_000;
+const DOWNLOAD_TIMEOUT = 20_000;
+
+/**
+ * Cleans a track/artist string to produce better search queries.
+ * Removes parenthetical content, featured artists, and other noise.
+ */
+function cleanSearchQuery(track: string, artist: string): string {
+  // Remove parenthetical content: "Song (Remix)" → "Song"
+  const cleanTrack = track.replace(/\s*\([^)]*\)/g, '').replace(/\s*\[[^\]]*\]/g, '').trim();
+  // Take only the primary artist (before comma)
+  const cleanArtist = artist.split(',')[0].split(' feat')[0].split(' ft')[0].split(' &')[0].trim();
+  return `${cleanTrack} ${cleanArtist}`.trim();
+}
 
 /**
  * Finds the best matching song from search results by comparing title and artist.
@@ -155,7 +174,7 @@ async function tryInvidiousYouTube(
 
       const searchUrl = `${instance}/api/v1/search?q=${encodeURIComponent(query)}&type=video&sort_by=relevance`;
       const searchResponse = await axios.get<InvidiousVideo[]>(searchUrl, {
-        timeout: REQUEST_TIMEOUT,
+        timeout: INVIDIOUS_TIMEOUT,
         headers: { 'User-Agent': 'Mozilla/5.0' },
       });
 
@@ -183,7 +202,7 @@ async function tryInvidiousYouTube(
       // Get video info which contains audio stream URLs
       const videoInfoUrl = `${instance}/api/v1/videos/${match.videoId}?fields=title,author,lengthSeconds,adaptiveFormats`;
       const infoResponse = await axios.get(videoInfoUrl, {
-        timeout: REQUEST_TIMEOUT,
+        timeout: INVIDIOUS_TIMEOUT,
         headers: { 'User-Agent': 'Mozilla/5.0' },
       });
 
@@ -218,7 +237,7 @@ async function tryInvidiousYouTube(
         duration: `${Date.now() - startTime}ms`,
       });
 
-      const buffer = await downloadAudioBuffer(audioFormat.url, 30_000);
+      const buffer = await downloadAudioBuffer(audioFormat.url, DOWNLOAD_TIMEOUT);
 
       logger.info('[MUSIC_DL] Invidious download complete', {
         title: track,
@@ -267,7 +286,7 @@ async function trySaavnDev(
     logger.info('[MUSIC_DL] saavn.dev search started', { query });
 
     const searchUrl = `https://saavn.dev/api/search/songs?query=${encodeURIComponent(query)}&limit=5`;
-    const searchResponse = await axios.get(searchUrl, { timeout: REQUEST_TIMEOUT });
+    const searchResponse = await axios.get(searchUrl, { timeout: SAAVN_TIMEOUT });
     const results = searchResponse.data?.data?.results;
 
     if (!results || !Array.isArray(results) || results.length === 0) {
@@ -298,7 +317,7 @@ async function trySaavnDev(
       duration: `${Date.now() - startTime}ms`,
     });
 
-    const buffer = await downloadAudioBuffer(downloadUrl);
+    const buffer = await downloadAudioBuffer(downloadUrl, DOWNLOAD_TIMEOUT);
     const metadata = extractMetadata(match, track, artist);
 
     logger.info('[MUSIC_DL] saavn.dev download complete', {
@@ -350,7 +369,7 @@ async function tryJioSaavnDirect(
         n: 5,
         p: 1,
       },
-      timeout: REQUEST_TIMEOUT,
+      timeout: JIOSAAVN_TIMEOUT,
       headers: { 'User-Agent': 'Mozilla/5.0' },
     });
 
@@ -383,7 +402,7 @@ async function tryJioSaavnDirect(
       duration: `${Date.now() - startTime}ms`,
     });
 
-    const buffer = await downloadAudioBuffer(downloadUrl);
+    const buffer = await downloadAudioBuffer(downloadUrl, DOWNLOAD_TIMEOUT);
     const metadata = extractMetadata(match, track, artist);
 
     logger.info('[MUSIC_DL] JioSaavn direct download complete', {
@@ -423,7 +442,7 @@ async function tryJioSaavnDirect(
  * No single provider failure causes the entire request to fail.
  */
 export async function getSongAudio(track: string, artist: string): Promise<AudioResult> {
-  const query = `${track} ${artist}`;
+  const query = cleanSearchQuery(track, artist);
   const startTime = Date.now();
 
   logger.info('[MUSIC_DL] Music download requested', { track, artist, query });

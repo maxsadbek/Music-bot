@@ -4,6 +4,12 @@ import { getSongAudio, AudioSourceError } from '../lib/services/audio-source';
 
 vi.mock('axios');
 
+/** Number of Invidious instances to mock (must match INVIDIOUS_INSTANCES length in audio-source.ts). */
+const INSTANCE_COUNT = 8;
+
+/** Creates an empty mock response for Invidious search. */
+const invidiousEmpty = { data: [] };
+
 describe('Audio Source Service', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -11,12 +17,9 @@ describe('Audio Source Service', () => {
 
   it('should search saavn.dev and return downloaded audio buffer', async () => {
     // Invidious returns empty/no results (all instances)
-    const invidiousEmpty = { data: [] };
-    vi.mocked(axios.get)
-      .mockResolvedValueOnce(invidiousEmpty as never) // inv.nadeko.net
-      .mockResolvedValueOnce(invidiousEmpty as never) // invidious.fdn.fr
-      .mockResolvedValueOnce(invidiousEmpty as never) // vid.puffyan.us
-      .mockResolvedValueOnce(invidiousEmpty as never); // invidious.nerdvpn.de
+    for (let i = 0; i < INSTANCE_COUNT; i++) {
+      vi.mocked(axios.get).mockResolvedValueOnce(invidiousEmpty as never);
+    }
 
     // saavn.dev returns results
     const mockSearchResponse = {
@@ -50,27 +53,26 @@ describe('Audio Source Service', () => {
     expect(result.durationSeconds).toBe(275);
     expect(result.buffer).toEqual(mockAudioBuffer);
 
-    expect(axios.get).toHaveBeenCalledTimes(6);
+    // INSTANCE_COUNT invidious + 1 saavn search + 1 saavn download
+    const expectedCalls = INSTANCE_COUNT + 2;
+    expect(axios.get).toHaveBeenCalledTimes(expectedCalls);
     expect(axios.get).toHaveBeenNthCalledWith(
-      5,
+      INSTANCE_COUNT + 1,
       expect.stringContaining('saavn.dev/api/search/songs'),
-      expect.objectContaining({ timeout: 12000 })
+      expect.objectContaining({ timeout: 10000 })
     );
     expect(axios.get).toHaveBeenNthCalledWith(
-      6,
+      INSTANCE_COUNT + 2,
       'https://cdn.example.com/high.mp3',
       expect.objectContaining({ responseType: 'arraybuffer', timeout: 20000 })
     );
   });
 
   it('should fall back to JioSaavn direct API when saavn.dev returns no results', async () => {
-    // Invidious returns empty/no results
-    const invidiousEmpty = { data: [] };
-    vi.mocked(axios.get)
-      .mockResolvedValueOnce(invidiousEmpty as never) // inv.nadeko.net
-      .mockResolvedValueOnce(invidiousEmpty as never) // invidious.fdn.fr
-      .mockResolvedValueOnce(invidiousEmpty as never) // vid.puffyan.us
-      .mockResolvedValueOnce(invidiousEmpty as never); // invidious.nerdvpn.de
+    // Invidious returns empty/no results (all instances)
+    for (let i = 0; i < INSTANCE_COUNT; i++) {
+      vi.mocked(axios.get).mockResolvedValueOnce(invidiousEmpty as never);
+    }
 
     // saavn.dev returns empty results
     vi.mocked(axios.get)
@@ -105,15 +107,16 @@ describe('Audio Source Service', () => {
     expect(result.artist).toBe('Kendrick Lamar');
     expect(result.buffer).toEqual(mockAudioBuffer);
 
-    // Should have called: 4 invidious + 1 saavn + 1 jiosaavn + 1 download = 7
-    expect(axios.get).toHaveBeenCalledTimes(7);
+    // INSTANCE_COUNT invidious + 1 saavn + 1 jiosaavn search + 1 jiosaavn download
+    const expectedCalls = INSTANCE_COUNT + 3;
+    expect(axios.get).toHaveBeenCalledTimes(expectedCalls);
     expect(axios.get).toHaveBeenNthCalledWith(
-      5,
+      INSTANCE_COUNT + 1,
       expect.stringContaining('saavn.dev/api/search/songs'),
       expect.anything()
     );
     expect(axios.get).toHaveBeenNthCalledWith(
-      6,
+      INSTANCE_COUNT + 2,
       'https://www.jiosaavn.com/api.php',
       expect.anything()
     );
@@ -134,13 +137,10 @@ describe('Audio Source Service', () => {
   });
 
   it('should throw AudioSourceError when download returns HTML', async () => {
-    // Invidious returns empty
-    const invidiousEmpty = { data: [] };
-    vi.mocked(axios.get)
-      .mockResolvedValueOnce(invidiousEmpty as never)
-      .mockResolvedValueOnce(invidiousEmpty as never)
-      .mockResolvedValueOnce(invidiousEmpty as never)
-      .mockResolvedValueOnce(invidiousEmpty as never);
+    // Invidious returns empty (all instances)
+    for (let i = 0; i < INSTANCE_COUNT; i++) {
+      vi.mocked(axios.get).mockResolvedValueOnce(invidiousEmpty as never);
+    }
 
     // saavn.dev returns results but download returns HTML
     vi.mocked(axios.get)

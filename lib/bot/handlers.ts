@@ -525,10 +525,14 @@ export async function handleCallbackQuery(ctx: Context): Promise<void> {
 
   if (callbackData.startsWith('get_song:')) {
     const jobId = callbackData.split(':')[1];
-    await ctx.answerCallbackQuery();
-
     const chatId = ctx.callbackQuery?.message?.chat?.id;
-    if (!chatId) return;
+    if (!chatId) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+
+    // Answer the callback query IMMEDIATELY — prevents Telegram waiting animation timeout
+    await ctx.answerCallbackQuery();
 
     try {
       const job = await getReelJob(jobId);
