@@ -572,11 +572,9 @@ export async function handleCallbackQuery(ctx: Context): Promise<void> {
 
       // Fallback: search and download audio from external source
       if (!sent) {
-        const downloadStart = Date.now();
-        console.log(`[PERF] Audio search START query="${job.songTitle} - ${job.songArtist}"`);
         const audio = await getSongAudio(job.songTitle, job.songArtist);
-        console.log(`[PERF] Audio search END: ${Date.now() - downloadStart}ms result=FOUND`);
 
+        const sendStart = Date.now();
         await ctx.api.sendAudio(
           chatId,
           new InputFile(audio.buffer, `${audio.title}.mp3`),
@@ -586,6 +584,7 @@ export async function handleCallbackQuery(ctx: Context): Promise<void> {
             duration: audio.durationSeconds,
           }
         );
+        console.log(`[PERF] Telegram audio send END: ${Date.now() - sendStart}ms`);
       }
 
       logger.info('Audio file sent to Telegram', {

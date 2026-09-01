@@ -1,23 +1,16 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import axios from 'axios';
-import { getSongAudio, AudioSourceError } from '../lib/services/audio-source';
+import { getSongAudio, AudioSourceError, clearAudioCache } from '../lib/services/audio-source';
 
 vi.mock('axios');
-
-const INSTANCE_COUNT = 3;
-
-const invidiousEmpty = { data: [] };
 
 describe('Audio Source Service', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearAudioCache();
   });
 
   it('should search saavn.dev and return downloaded audio buffer', async () => {
-    for (let i = 0; i < INSTANCE_COUNT; i++) {
-      vi.mocked(axios.get).mockResolvedValueOnce(invidiousEmpty as never);
-    }
-
     const mockSearchResponse = {
       data: {
         data: {
@@ -35,29 +28,24 @@ describe('Audio Source Service', () => {
         },
       },
     };
-
     const mockAudioBuffer = Buffer.from('mock-mp3-bytes');
 
-    vi.mocked(axios.get)
-      .mockResolvedValueOnce(mockSearchResponse as never)
-      .mockResolvedValueOnce({ data: mockAudioBuffer } as never);
+    vi.mocked(axios.get).mockImplementation(async (url: any) => {
+      const urlStr = typeof url === 'string' ? url : String(url);
+      if (urlStr.includes('saavn.dev/api/search')) return mockSearchResponse as never;
+      if (urlStr.includes('cdn.example.com')) return { data: mockAudioBuffer } as never;
+      return { data: [] } as never;
+    });
 
     const result = await getSongAudio('United In Grief', 'Kendrick Lamar');
 
     expect(result.title).toBe('United In Grief');
     expect(result.artist).toBe('Kendrick Lamar');
     expect(result.durationSeconds).toBe(275);
-    expect(result.buffer).toEqual(mockAudioBuffer);
+    expect(result.buffer.toString()).toBe('mock-mp3-bytes');
   });
 
   it('should fall back to JioSaavn direct API when saavn.dev returns no results', async () => {
-    for (let i = 0; i < INSTANCE_COUNT; i++) {
-      vi.mocked(axios.get).mockResolvedValueOnce(invidiousEmpty as never);
-    }
-
-    vi.mocked(axios.get)
-      .mockResolvedValueOnce({ data: { data: { results: [] } } } as never);
-
     const mockJioResponse = {
       data: {
         results: [
@@ -73,23 +61,24 @@ describe('Audio Source Service', () => {
         ],
       },
     };
-
     const mockAudioBuffer = Buffer.from('mock-jio-mp3-bytes');
 
-    vi.mocked(axios.get)
-      .mockResolvedValueOnce(mockJioResponse as never)
-      .mockResolvedValueOnce({ data: mockAudioBuffer } as never);
+    vi.mocked(axios.get).mockImplementation(async (url: any) => {
+      const urlStr = typeof url === 'string' ? url : String(url);
+      if (urlStr.includes('jiosaavn.com/api.php')) return mockJioResponse as never;
+      if (urlStr.includes('cdn2.example.com')) return { data: mockAudioBuffer } as never;
+      return { data: { data: { results: [] } } } as never;
+    });
 
     const result = await getSongAudio('United In Grief', 'Kendrick Lamar');
 
     expect(result.title).toBe('United In Grief');
     expect(result.artist).toBe('Kendrick Lamar');
-    expect(result.buffer).toEqual(mockAudioBuffer);
+    expect(result.buffer.toString()).toBe('mock-jio-mp3-bytes');
   });
 
   it('should throw AudioSourceError when no search results are found from any provider', async () => {
-    vi.mocked(axios.get)
-      .mockResolvedValue({ data: [] } as never);
+    vi.mocked(axios.get).mockImplementation(async () => ({ data: [] } as never));
 
     await expect(getSongAudio('Unknown Track', 'Unknown Artist')).rejects.toThrow(
       AudioSourceError
@@ -97,27 +86,28 @@ describe('Audio Source Service', () => {
   });
 
   it('should throw AudioSourceError when download returns HTML', async () => {
-    for (let i = 0; i < INSTANCE_COUNT; i++) {
-      vi.mocked(axios.get).mockResolvedValueOnce(invidiousEmpty as never);
-    }
-
-    vi.mocked(axios.get)
-      .mockResolvedValueOnce({
-        data: {
+    vi.mocked(axios.get).mockImplementation(async (url: any) => {
+      const urlStr = typeof url === 'string' ? url : String(url);
+      if (urlStr.includes('saavn.dev/api/search')) {
+        return {
           data: {
-            results: [
-              {
-                name: 'Test Song',
-                artists: { primary: [{ name: 'Test Artist' }] },
-                downloadUrl: [{ url: 'https://cdn.example.com/song.mp3' }],
-              },
-            ],
+            data: {
+              results: [
+                {
+                  name: 'Test Song',
+                  artists: { primary: [{ name: 'Test Artist' }] },
+                  downloadUrl: [{ url: 'https://cdn.example.com/song.mp3' }],
+                },
+              ],
+            },
           },
-        },
-      } as never)
-      .mockResolvedValueOnce({
-        data: Buffer.from('<!doctype html><html></html>'),
-      } as never);
+        } as never;
+      }
+      if (urlStr.includes('cdn.example.com')) {
+        return { data: Buffer.from('<!doctype html><html></html>') } as never;
+      }
+      return { data: [] } as never;
+    });
 
     await expect(getSongAudio('Test Song', 'Test Artist')).rejects.toThrow(
       AudioSourceError
