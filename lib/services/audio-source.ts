@@ -6,12 +6,26 @@ export interface AudioResult {
   title: string;
   artist: string;
   durationSeconds?: number;
+  spotifyUrl?: string;
 }
 
 export class AudioSourceError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'AudioSourceError';
+  }
+}
+
+/** Error thrown when audio providers fail but Spotify found the track. */
+export class SpotifyFallbackError extends AudioSourceError {
+  constructor(
+    message: string,
+    public spotifyUrl: string,
+    public spotifyTitle: string,
+    public spotifyArtist: string,
+  ) {
+    super(message);
+    this.name = 'SpotifyFallbackError';
   }
 }
 
@@ -23,24 +37,41 @@ const INVIDIOUS_INSTANCES = [
   'https://invidious.nerdvpn.de',
 ];
 
-// ── In-memory cache ──────────────────────────────────────────────────────────
+// ── Caches ───────────────────────────────────────────────────────────────────
 const audioCache = new Map<string, { result: AudioResult; expiresAt: number }>();
-const CACHE_TTL_MS = 30 * 60 * 1000;
+const AUDIO_CACHE_TTL_MS = 30 * 60 * 1000;
 
-function cacheGet(key: string): AudioResult | null {
+const spotifyCache = new Map<string, { result: SpotifyMeta | null; expiresAt: number }>();
+const SPOTIFY_CACHE_TTL_MS = 60 * 60 * 1000;
+
+interface SpotifyMeta { spotifyUrl: string; title: string; artist: string; }
+
+function audioCacheGet(key: string): AudioResult | null {
   const e = audioCache.get(key);
   if (!e) return null;
   if (Date.now() > e.expiresAt) { audioCache.delete(key); return null; }
   return e.result;
 }
 
-function cacheSet(key: string, result: AudioResult): void {
-  audioCache.set(key, { result, expiresAt: Date.now() + CACHE_TTL_MS });
+function audioCacheSet(key: string, result: AudioResult): void {
+  audioCache.set(key, { result, expiresAt: Date.now() + AUDIO_CACHE_TTL_MS });
 }
 
 /** Clear audio cache (exported for testing). */
 export function clearAudioCache(): void {
   audioCache.clear();
+  spotifyCache.clear();
+}
+
+function spotifyCacheGet(key: string): SpotifyMeta | null {
+  const e = spotifyCache.get(key);
+  if (!e) return null;
+  if (Date.now() > e.expiresAt) { spotifyCache.delete(key); return null; }
+  return e.result;
+}
+
+function spotifyCacheSet(key: string, result: SpotifyMeta | null): void {
+  spotifyCache.set(key, { result, expiresAt: Date.now() + SPOTIFY_CACHE_TTL_MS });
 }
 
 function normalizeCacheKey(artist: string, title: string): string {
@@ -63,9 +94,35 @@ function buildQueryVariants(track: string, artist: string): string[] {
   if (v1) variants.push(v1);
   const titleOnly = cleanTrack.replace(/-/g, ' ').replace(/\s+/g, ' ').trim();
   const v2 = `${titleOnly} ${cleanArtist}`.trim();
-  if (v2 && v2 !== v1 && v2) variants.push(v2);
+  if (v2 && v2 !== v1) variants.push(v2);
   if (titleOnly && titleOnly !== v1 && titleOnly !== v2) variants.push(titleOnly);
   return variants;
+}
+
+/** Normalize string for matching: lowercase, strip punctuation, remove noise words. */
+function normalizeForMatch(s: string): string {
+  return s.toLowerCase()
+    .replace(/[-–—_]/g, ' ')
+    .replace(/[''`]/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/\b(official|audio|lyrics|video|remix|slowed|sped up|prod\.?|prod by)\b/gi, '')
+    .replace(/[^a-z0-9\s]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function titleMatches(spTitle: string, acTitle: string): boolean {
+  const nsp = normalizeForMatch(spTitle);
+  const nac = normalizeForMatch(acTitle);
+  if (!nsp || !nac) return false;
+  return nsp.includes(nac) || nac.includes(nsp) || nsp === nac;
+}
+
+function artistMatches(spArtist: string, acArtist: string): boolean {
+  const nsp = normalizeForMatch(spArtist);
+  const nac = normalizeForMatch(acArtist);
+  if (!nsp || !nac) return false;
+  return nsp.includes(nac) || nac.includes(nsp);
 }
 
 function findBestMatch(results: unknown[], track: string, artist: string): unknown | null {
@@ -110,7 +167,7 @@ async function downloadAudioBuffer(url: string, signal?: AbortSignal): Promise<B
   return buffer;
 }
 
-// ── Provider 1: Invidious (YouTube) — instances run in parallel ──────────────
+// ── Provider 1: Invidious (YouTube) — instances parallel ─────────────────────
 
 interface InvidiousVideo { videoId: string; title: string; author: string; lengthSeconds: number; type: string; }
 
@@ -132,14 +189,9 @@ async function tryInvidiousInstance(instance: string, query: string, track: stri
 }
 
 async function tryInvidiousParallel(query: string, track: string, artist: string, signal?: AbortSignal): Promise<AudioResult | null> {
-  // Run all instances in parallel — first valid result wins
-  const promises = INVIDIOUS_INSTANCES.map(instance =>
-    tryInvidiousInstance(instance, query, track, artist, signal).catch(() => null)
-  );
+  const promises = INVIDIOUS_INSTANCES.map(inst => tryInvidiousInstance(inst, query, track, artist, signal).catch(() => null));
   const results = await Promise.allSettled(promises);
-  for (const r of results) {
-    if (r.status === 'fulfilled' && r.value) return r.value;
-  }
+  for (const r of results) { if (r.status === 'fulfilled' && r.value) return r.value; }
   return null;
 }
 
@@ -177,19 +229,103 @@ async function tryJioSaavnDirect(query: string, track: string, artist: string, s
   return { buffer, title: metadata.title, artist: metadata.artist, durationSeconds: metadata.durationSeconds };
 }
 
+// ── Provider 4: Spotify metadata (NOT audio source) ─────────────────────────
+
+let spotifyToken: string | null = null;
+let spotifyTokenExpiry = 0;
+
+async function getSpotifyToken(): Promise<string | null> {
+  if (spotifyToken && Date.now() < spotifyTokenExpiry) return spotifyToken;
+  const clientId = process.env.SPOTIFY_CLIENT_ID;
+  const clientSecret = process.env.SPOTIFY_CLIENT_SECRET;
+  if (!clientId || !clientSecret) return null;
+  try {
+    const response = await axios.post('https://accounts.spotify.com/api/token',
+      'grant_type=client_credentials',
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}` }, timeout: PROVIDER_TIMEOUT_MS },
+    );
+    spotifyToken = response.data.access_token;
+    spotifyTokenExpiry = Date.now() + (response.data.expires_in - 60) * 1000;
+    return spotifyToken;
+  } catch {
+    return null;
+  }
+}
+
+async function trySpotifyMetadata(query: string, track: string, artist: string, signal?: AbortSignal): Promise<SpotifyMeta | null> {
+  const cacheKey = `spotify:${normalizeCacheKey(artist, track)}`;
+  const cached = spotifyCacheGet(cacheKey);
+  if (cached !== null) {
+    console.log(`[PERF] Spotify metadata CACHE ${cached ? 'HIT' : 'MISS'}`);
+    return cached;
+  }
+
+  const token = await getSpotifyToken();
+  if (!token) { spotifyCacheSet(cacheKey, null); return null; }
+
+  try {
+    console.log(`[PERF] Spotify search START query="${query}"`);
+    const response = await axios.get(`https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track&limit=5`, {
+      headers: { Authorization: `Bearer ${token}` },
+      timeout: PROVIDER_TIMEOUT_MS, signal,
+    });
+
+    const tracks = response.data?.tracks?.items;
+    if (!tracks || tracks.length === 0) {
+      console.log(`[PERF] Spotify search END result=NOT_FOUND`);
+      spotifyCacheSet(cacheKey, null);
+      return null;
+    }
+
+    for (const sp of tracks) {
+      const spTitle = sp.name || '';
+      const spArtist = (sp.artists || []).map((a: any) => a.name).join(', ');
+      if (titleMatches(spTitle, track) && artistMatches(spArtist, artist)) {
+        const result: SpotifyMeta = {
+          spotifyUrl: sp.external_urls?.spotify || '',
+          title: spTitle,
+          artist: spArtist,
+        };
+        console.log(`[PERF] Spotify search END result=FOUND title="${spTitle}" artist="${spArtist}"`);
+        console.log(`[PERF] Spotify metadata normalized artist="${spArtist}" title="${spTitle}"`);
+        spotifyCacheSet(cacheKey, result);
+        return result;
+      }
+    }
+
+    console.log(`[PERF] Spotify search END result=NOT_FOUND (no match)`);
+    spotifyCacheSet(cacheKey, null);
+    return null;
+  } catch {
+    console.log(`[PERF] Spotify search END result=ERROR`);
+    spotifyCacheSet(cacheKey, null);
+    return null;
+  }
+}
+
+// ── Run audio providers in parallel ──────────────────────────────────────────
+
+async function runAudioProviders(query: string, track: string, artist: string, signal?: AbortSignal): Promise<AudioResult | null> {
+  const promises = [
+    tryInvidiousParallel(query, track, artist, signal).then(r => r ?? Promise.reject(new Error('not found'))),
+    trySaavnDev(query, track, artist, signal).then(r => r ?? Promise.reject(new Error('not found'))),
+    tryJioSaavnDirect(query, track, artist, signal).then(r => r ?? Promise.reject(new Error('not found'))),
+  ];
+  try {
+    return await Promise.any(promises);
+  } catch {
+    return null;
+  }
+}
+
 // ── Main entry ───────────────────────────────────────────────────────────────
 
-/**
- * Finds and downloads audio. All providers run in PARALLEL.
- * First valid result wins via Promise.any. Max 5s per provider.
- */
 export async function getSongAudio(track: string, artist: string): Promise<AudioResult> {
   const startTime = Date.now();
   const query = cleanSearchQuery(track, artist);
   const cacheKey = normalizeCacheKey(artist, track);
 
-  // Cache check
-  const cached = cacheGet(cacheKey);
+  const cached = audioCacheGet(cacheKey);
   if (cached) {
     console.log(`[PERF] Audio search START artist="${artist}" track="${track}" cache=HIT`);
     console.log(`[PERF] Audio search TOTAL duration=${Date.now() - startTime}ms result=FOUND provider=cache`);
@@ -200,50 +336,60 @@ export async function getSongAudio(track: string, artist: string): Promise<Audio
 
   const variants = buildQueryVariants(track, artist);
 
-  for (let vi = 0; vi < variants.length; vi++) {
-    const q = variants[vi];
-    console.log(`[PERF] Audio search variant ${vi + 1}/${variants.length} query="${q}"`);
+  // Round 1: Try all providers + Spotify in parallel
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROVIDER_TIMEOUT_MS);
+  const signal = controller.signal;
 
-    // Single AbortController for this variant — all providers share it
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), PROVIDER_TIMEOUT_MS);
-    const signal = controller.signal;
+  console.log(`[PERF] Provider START name="invidious" query="${query}"`);
+  console.log(`[PERF] Provider START name="saavn" query="${query}"`);
+  console.log(`[PERF] Provider START name="jiosaavn" query="${query}"`);
+  console.log(`[PERF] Spotify search START query="${query}"`);
 
-    // Fire all providers in PARALLEL
-    console.log(`[PERF] Provider START name="invidious" query="${q}"`);
-    console.log(`[PERF] Provider START name="saavn" query="${q}"`);
-    console.log(`[PERF] Provider START name="jiosaavn" query="${q}"`);
+  const round1Audio = runAudioProviders(query, track, artist, signal);
+  const round1Spotify = trySpotifyMetadata(query, track, artist, signal);
 
-    const providerPromises = [
-      tryInvidiousParallel(q, track, artist, signal)
-        .then(r => { if (r) console.log(`[PERF] Provider END name="invidious" duration=${Date.now() - startTime}ms result=FOUND`); return r; })
-        .catch(() => { console.log(`[PERF] Provider END name="invidious" duration=${Date.now() - startTime}ms result=ERROR`); return null; }),
-      trySaavnDev(q, track, artist, signal)
-        .then(r => { if (r) console.log(`[PERF] Provider END name="saavn" duration=${Date.now() - startTime}ms result=FOUND`); return r; })
-        .catch(() => { console.log(`[PERF] Provider END name="saavn" duration=${Date.now() - startTime}ms result=ERROR`); return null; }),
-      tryJioSaavnDirect(q, track, artist, signal)
-        .then(r => { if (r) console.log(`[PERF] Provider END name="jiosaavn" duration=${Date.now() - startTime}ms result=FOUND`); return r; })
-        .catch(() => { console.log(`[PERF] Provider END name="jiosaavn" duration=${Date.now() - startTime}ms result=ERROR`); return null; }),
-    ];
+  const [audioResult, spotifyResult] = await Promise.all([round1Audio, round1Spotify]);
+  clearTimeout(timer);
 
-    // Wrap each to reject on null so Promise.any skips non-results
-    const racePromises = providerPromises.map(p =>
-      p.then(r => r ?? Promise.reject(new Error('not found')))
-    );
-
-    try {
-      const result = await Promise.any(racePromises);
-      clearTimeout(timer);
-      console.log(`[PERF] Audio search FIRST_RESULT duration=${Date.now() - startTime}ms`);
-      console.log(`[PERF] Audio search TOTAL duration=${Date.now() - startTime}ms result=FOUND`);
-      cacheSet(cacheKey, result);
-      return result;
-    } catch {
-      clearTimeout(timer);
-      console.log(`[PERF] Audio search variant ${vi + 1} all providers failed`);
-    }
+  if (audioResult) {
+    console.log(`[PERF] Audio search FIRST_RESULT duration=${Date.now() - startTime}ms`);
+    console.log(`[PERF] Audio search TOTAL duration=${Date.now() - startTime}ms result=FOUND`);
+    audioResult.spotifyUrl = spotifyResult?.spotifyUrl;
+    audioCacheSet(cacheKey, audioResult);
+    return audioResult;
   }
 
-  console.log(`[PERF] Audio search FAILED reason="all providers exhausted" variants=${variants.length} totalMs=${Date.now() - startTime}`);
+  // Round 2: If Spotify found metadata, retry audio search with normalized query
+  if (spotifyResult) {
+    const spotifyQuery = `${spotifyResult.title} ${spotifyResult.artist}`.trim();
+    console.log(`[PERF] Audio retry using Spotify metadata START artist="${spotifyResult.artist}" title="${spotifyResult.title}"`);
+
+    const controller2 = new AbortController();
+    const timer2 = setTimeout(() => controller2.abort(), PROVIDER_TIMEOUT_MS);
+    const retryResult = await runAudioProviders(spotifyQuery, spotifyResult.title, spotifyResult.artist, controller2.signal);
+    clearTimeout(timer2);
+
+    if (retryResult) {
+      console.log(`[PERF] Audio retry using Spotify metadata END result=FOUND duration=${Date.now() - startTime}ms`);
+      console.log(`[PERF] Audio search TOTAL duration=${Date.now() - startTime}ms result=FOUND`);
+      retryResult.spotifyUrl = spotifyResult.spotifyUrl;
+      audioCacheSet(cacheKey, retryResult);
+      return retryResult;
+    }
+    console.log(`[PERF] Audio retry using Spotify metadata END result=FAILED duration=${Date.now() - startTime}ms`);
+  }
+
+  console.log(`[PERF] Audio search FAILED reason="all providers exhausted" totalMs=${Date.now() - startTime}`);
+
+  if (spotifyResult) {
+    throw new SpotifyFallbackError(
+      `Audio not found but Spotify track exists: ${spotifyResult.title} — ${spotifyResult.artist}`,
+      spotifyResult.spotifyUrl,
+      spotifyResult.title,
+      spotifyResult.artist,
+    );
+  }
+
   throw new AudioSourceError(`No audio results found for "${query}".`);
 }

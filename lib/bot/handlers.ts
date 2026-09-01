@@ -6,7 +6,7 @@ import {
 } from '../validation/instagram';
 import { getInstagramReel, cleanupTempFile } from '../services/instagram';
 import { downloadMediaBuffer, identifySong, SongResult } from '../services/music-recognition';
-import { getSongAudio, AudioSourceError } from '../services/audio-source';
+import { getSongAudio, AudioSourceError, SpotifyFallbackError } from '../services/audio-source';
 import {
   generateJobId,
   getReelJob,
@@ -597,7 +597,9 @@ export async function handleCallbackQuery(ctx: Context): Promise<void> {
 
       let userMsg =
         '⚠️ Qo\'shiqni yuklab bo\'lmadi. Keyinroq qayta urinib ko\'ring.';
-      if (error instanceof AudioSourceError) {
+      if (error instanceof SpotifyFallbackError) {
+        userMsg = `🎵 Qo\'shiq topildi:\n${error.spotifyTitle} — ${error.spotifyArtist}\n\n🔗 Spotify: ${error.spotifyUrl}`;
+      } else if (error instanceof AudioSourceError) {
         userMsg = '⚠️ Qo\'shiq topilmadi. Keyinroq qayta urinib ko\'ring.';
       }
       await ctx.api.sendMessage(chatId, userMsg).catch(() => {});
