@@ -155,6 +155,7 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
     // ── 1. POST /api/jobs — create download job (skip /api/info) ─────────
     // /api/info adds 5-10s on cold start. We skip it entirely.
     // private/deleted detection happens via /api/jobs error response.
+    console.log(`[PERF] Jobs request START url=${RENDER_DOWNLOADER_URL}/api/jobs`);
     const jobStart = Date.now();
     const { data: jobData, durationMs: jobDuration } = await fetchJsonWithTimeout(
       `${RENDER_DOWNLOADER_URL}/api/jobs`,
@@ -162,7 +163,10 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
       { url: normalizedUrl, format: 'mp4', quality: '720p' },
       API_TIMEOUT_MS,
     );
-    console.log(`[PERF] /api/jobs END duration=${jobDuration}ms`);
+    console.log(`[PERF] Jobs request END duration=${jobDuration}ms`);
+    if (jobDuration > 5000) {
+      console.log(`[PERF] Jobs cold-start duration=${jobDuration}ms (Render server likely cold)`);
+    }
 
     if (!jobData) {
       throw new InstagramApiError('Empty response from downloader /api/jobs endpoint.');
@@ -187,19 +191,20 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
       const directUrlFromJob =
         jobData.fileUrl || jobData.file_url || jobData.downloadUrl || jobData.download_url || jobData.url;
       if (directUrlFromJob && typeof directUrlFromJob === 'string') {
-        console.log(`[PERF] Direct URL from /api/jobs response — skipping poll`);
+        console.log(`[PERF] Jobs response type=DIRECT_URL duration=${jobDuration}ms`);
         fileUrl = directUrlFromJob;
       } else {
+        console.log(`[PERF] Jobs response type=JOB_ID jobId=${jobId} duration=${jobDuration}ms`);
         // ── 3. Adaptive poll ─────────────────────────────────────────────
         const pollStart = Date.now();
         fileUrl = await pollJobStatus(jobId);
-        console.log(`[PERF] Job poll COMPLETE duration=${Date.now() - pollStart}ms`);
+        console.log(`[PERF] Polling TOTAL duration=${Date.now() - pollStart}ms`);
       }
     } else {
       // No job ID — try to extract URL directly from response
       const directUrl = extractMediaUrlFromResponse(jobData);
       if (directUrl) {
-        console.log(`[PERF] Direct URL extracted from /api/jobs response`);
+        console.log(`[PERF] Jobs response type=DIRECT_URL (no jobId) duration=${jobDuration}ms`);
         fileUrl = directUrl;
       } else {
         throw new InstagramApiError('No job ID or direct file URL returned from downloader.');
@@ -209,7 +214,7 @@ export async function getInstagramReel(url: string): Promise<InstagramReelMedia>
     // ── 4. Download video ────────────────────────────────────────────────
     const dlStart = Date.now();
     const { filePath: videoFilePath, buffer: videoBuffer } = await downloadToTempFile(fileUrl, shortcode);
-    console.log(`[PERF] Video download END duration=${Date.now() - dlStart}ms size=${videoBuffer.length}`);
+    console.log(`[PERF] File download TOTAL duration=${Date.now() - dlStart}ms size=${videoBuffer.length}`);
 
     const totalDuration = Date.now() - totalStart;
     console.log(`[PERF] Instagram extraction TOTAL duration=${totalDuration}ms`);
