@@ -4,8 +4,9 @@ import { logger } from '../../../../lib/utils/logger';
 export const dynamic = 'force-dynamic';
 
 /**
- * Configure maximum execution duration for Vercel Serverless Functions.
- * The webhook returns 200 immediately; this duration applies to background processing.
+ * Maximum execution duration for Vercel Serverless Functions.
+ * Covers: bot.init() (cold start ~500ms) + handleUpdate
+ * (Instagram download ~15s + ACRCloud ~3s + Telegram upload ~5s).
  */
 export const maxDuration = 60;
 
@@ -13,14 +14,14 @@ export const maxDuration = 60;
  * POST /api/telegram/webhook
  *
  * Architecture:
- * 1. Validate webhook secret (fast, <1ms)
- * 2. Parse the raw Telegram update JSON (fast, <5ms)
- * 3. Return HTTP 200 to Telegram IMMEDIATELY — prevents retries
- * 4. Process the update in a detached promise (runs up to maxDuration)
+ * 1. Validate webhook secret (<1ms)
+ * 2. Parse the raw Telegram update JSON (<5ms)
+ * 3. Initialize bot via getBot() — bot.init() called once per cold start
+ * 4. Await bot.handleUpdate(update) — processes the full update inline
+ * 5. Return HTTP 200 to Telegram AFTER processing completes
  *
- * Telegram retries the webhook if it doesn't get a response within ~10s.
- * All long-running work (Instagram download, ACRCloud, video upload) happens
- * in the background AFTER the response is sent.
+ * With maxDuration = 60, Vercel keeps the function alive for up to 60s.
+ * This is enough for Instagram download + music recognition + video send.
  */
 export async function POST(req: Request): Promise<Response> {
   try {
@@ -56,47 +57,42 @@ export async function POST(req: Request): Promise<Response> {
     // Quick sanity check: is this a valid Telegram update?
     if (!update || typeof update.update_id !== 'number') {
       logger.warn('[Webhook] Received non-Telegram update body');
-      return new Response('OK', { status: 200 }); // Still 200 to prevent retries
+      return new Response('OK', { status: 200 });
     }
 
-    // ── 3. Return 200 to Telegram IMMEDIATELY ────────────────────────
-    //    Long-running processing happens in the detached promise below.
-    //    Vercel serverless functions continue running after the response
-    //    is sent, up to maxDuration (60s).
+    // ── 3. Initialize bot & process update BEFORE returning 200 ──────
+    //
+    // getBot() returns a cached singleton. On cold start it calls
+    // bot.init() (Telegram getMe) once; subsequent invocations reuse
+    // the same initialized instance.
+    //
+    // bot.handleUpdate() dispatches to registered handlers (start,
+    // text messages, callbacks) and awaits each one. This runs the
+    // full update flow inline — no detached promises.
+    const start = Date.now();
+    try {
+      const bot = await getBot();
+      await bot.handleUpdate(update);
+      logger.info('[Webhook] Update processed', {
+        duration: `${Date.now() - start}ms`,
+        type: update.message ? 'message'
+          : update.callback_query ? 'callback_query'
+          : update.inline_query ? 'inline_query'
+          : 'other',
+      });
+    } catch (error) {
+      logger.error('[Webhook] Update processing failed', error);
+      // Fall through to return 200 — prevents Telegram retries.
+      // The error is already logged; Telegram will retry if the
+      // update wasn't acknowledged by the handler.
+    }
 
-    processUpdateInBackground(update).catch((err) => {
-      logger.error('[Webhook] Background processing failed', err);
-    });
-
+    // ── 4. Return 200 to Telegram ────────────────────────────────────
     return new Response('OK', { status: 200 });
   } catch (error) {
     logger.error('[Webhook] Error in webhook handler', error);
-    // Return 200 even on error to prevent Telegram retries
+    // Return 200 even on unexpected errors to prevent Telegram retries
     return new Response('OK', { status: 200 });
-  }
-}
-
-/**
- * Processes a Telegram update in the background.
- * Called from a detached promise — errors are caught by the caller.
- *
- * On Vercel, the serverless function continues executing after the HTTP
- * response has been sent. The function stays alive for up to `maxDuration`.
- */
-async function processUpdateInBackground(update: Record<string, unknown>): Promise<void> {
-  const start = Date.now();
-  try {
-    const bot = await getBot();
-    await bot.handleUpdate(update as any);
-    logger.info('[Webhook] Update processed', {
-      duration: `${Date.now() - start}ms`,
-      type: update.message ? 'message'
-        : update.callback_query ? 'callback_query'
-        : update.inline_query ? 'inline_query'
-        : 'other',
-    });
-  } catch (error) {
-    logger.error('[Webhook] Update processing failed', error);
   }
 }
 
@@ -119,7 +115,7 @@ export async function GET(req: Request): Promise<Response> {
       {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
-      }
+      },
     );
   }
 
@@ -199,6 +195,6 @@ export async function GET(req: Request): Promise<Response> {
     {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
-    }
+    },
   );
 }
